@@ -154,19 +154,28 @@ def save_item(con, item: dict):
 client_groq = Groq(api_key=GROQ_API_KEY)
 
 CLASSIFY_PROMPT = """\
-Sos un analista de ciberseguridad especializado en PyMEs.
-Clasificá el siguiente evento de seguridad y respondé ÚNICAMENTE con JSON válido.
-No agregues texto antes ni después del JSON.
+Sos un analista de ciberseguridad especializado en pequeñas y medianas empresas.
+Clasificá el siguiente evento y respondé ÚNICAMENTE con JSON válido, sin texto adicional.
 
 Título: {title}
 Descripción: {desc}
+
+Reglas para sme_reason:
+- Explicá el impacto técnico concreto, no menciones "PyME" ni "empresa"
+- Referenciá el control CIS v8 IG1 más relevante (ej: CIS-7.3, CIS-9.2)
+- Máximo una línea, directo al punto
+- Ejemplos buenos:
+  "CIS-7.3: parche crítico pendiente en software de uso masivo"
+  "CIS-9.2: campaña de phishing activa via email corporativo"
+  "CIS-8.1: malware con capacidad de movimiento lateral en red local"
+  "CIS-10.1: ransomware activo — evaluar estado de backups offline"
 
 Formato requerido:
 {{
   "category": "ransomware|phishing|exploit|malware|vulnerability|breach|other",
   "severity": "high|medium|low",
   "sme_relevant": true|false,
-  "sme_reason": "una línea explicando relevancia para PyMEs argentinas",
+  "sme_reason": "CIS-X.X: impacto técnico concreto en una línea",
   "summary": "resumen en máximo 2 líneas en español"
 }}"""
 
