@@ -37,20 +37,61 @@ DB_PATH = "cti.db"
 # qué prioridades enviar: 1, 2, o 3
 SEND_PRIORITY_UP_TO = 2
 
+# Mapeo categoría → controles CIS v8 IG1 relevantes
+CIS_MAPPING = {
+    "ransomware": [
+        ("CIS-11.2", "Recuperación de datos"),
+        ("CIS-8.2",  "Antimalware"),
+        ("CIS-10.1", "Backups automáticos"),
+    ],
+    "phishing": [
+        ("CIS-9.2",  "Filtros de email"),
+        ("CIS-14.1", "Concientización"),
+        ("CIS-6.1",  "Gestión de cuentas"),
+    ],
+    "exploit": [
+        ("CIS-7.3",  "Parches de aplicaciones"),
+        ("CIS-7.2",  "Parches de SO"),
+        ("CIS-4.1",  "Inventario de software"),
+    ],
+    "malware": [
+        ("CIS-8.1",  "Antimalware en endpoints"),
+        ("CIS-7.1",  "Gestión de vulnerabilidades"),
+        ("CIS-6.2",  "Privilegio mínimo"),
+    ],
+    "vulnerability": [
+        ("CIS-7.1",  "Proceso de gestión de vulns"),
+        ("CIS-7.2",  "Parches de SO"),
+        ("CIS-7.3",  "Parches de aplicaciones"),
+    ],
+    "breach": [
+        ("CIS-3.1",  "Inventario de datos"),
+        ("CIS-6.1",  "Gestión de cuentas"),
+        ("CIS-13.1", "Monitoreo de red"),
+    ],
+    "other": [
+        ("CIS-1.1",  "Inventario de activos"),
+    ],
+}
+
+def get_cis_controls(category: str) -> list[tuple]:
+    return CIS_MAPPING.get(category, CIS_MAPPING["other"])
+
 # ── Base de datos ─────────────────────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            id        TEXT PRIMARY KEY,
-            title     TEXT,
-            source    TEXT,
-            category  TEXT,
-            severity  TEXT,
-            sme_flag  INTEGER,
-            sme_reason TEXT,
-            summary   TEXT,
-            ts        TEXT
+    CREATE TABLE IF NOT EXISTS items (
+        id          TEXT PRIMARY KEY,
+        title       TEXT,
+        source      TEXT,
+        category    TEXT,
+        severity    TEXT,
+        sme_flag    INTEGER,
+        sme_reason  TEXT,
+        cis_controls TEXT,
+        summary     TEXT,
+        ts          TEXT
         )
     """)
     con.commit()
@@ -62,14 +103,17 @@ def is_seen(con, item_id: str) -> bool:
     ).fetchone() is not None
 
 def save_item(con, item: dict):
+    controls = get_cis_controls(item["category"])
+    cis_json = json.dumps([c[0] for c in controls])
     con.execute(
-        "INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             item["id"], item["title"], item["source"],
             item["category"], item["severity"],
             1 if item["sme_relevant"] else 0,
-            item["sme_reason"], item["summary"],
-            datetime.utcnow().isoformat()
+            item["sme_reason"], cis_json,
+            item["summary"],
+            datetime.now(timezone.utc).isoformat()
         )
     )
     con.commit()
@@ -219,14 +263,59 @@ def format_message(item: dict, priority: int) -> str:
     sme   = item["sme_reason"][:120]
     link  = item.get("link", "")
 
+    controls = get_cis_controls(item["category"])
+    cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])  # máximo 2 en alerta
+
     msg = (
         f"{icon} P{priority} · {cat} · {item['source']}\n"
         f"*{title}*\n"
-        f"_{sme}_"
+        f"_{sme}_\n"
+        f"CIS: {cis_line}"
     )
     if link:
         msg += f"\n🔗 {link}"
     return msg
+
+def get_daily_summary(con) -> str | None:
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = con.execute("""
+        SELECT title, source, category, severity, sme_flag,
+               sme_reason, cis_controls, summary
+        FROM items
+        WHERE ts LIKE ?
+        ORDER BY
+            CASE severity
+                WHEN 'high'   THEN 1
+                WHEN 'medium' THEN 2
+                ELSE 3
+            END,
+            sme_flag DESC
+        LIMIT 5
+    """, (f"{today}%",)).fetchall()
+
+    if not rows:
+        return None
+
+    lines = ["📋 *Resumen CTI — " + today + "*\n"]
+    for i, row in enumerate(rows, 1):
+        title, source, category, severity, sme_flag, \
+        sme_reason, cis_json, summary = row
+
+        sev_icon = SEVERITY_ICON.get(severity, "⚪")
+        cat      = CATEGORY_LABEL.get(category, "INFO")
+        controls = json.loads(cis_json) if cis_json else []
+        cis_str  = " · ".join(f"`{c}`" for c in controls[:2])
+        sme_mark = "✅" if sme_flag else "➖"
+
+        lines.append(
+            f"{i}. {sev_icon} *{title[:80]}*\n"
+            f"   {cat} · {source} · {sme_mark}\n"
+            f"   _{summary[:100]}_\n"
+            f"   CIS: {cis_str}\n"
+        )
+
+    lines.append("_Generado automáticamente por cti\\_bot_")
+    return "\n".join(lines)
 
 # ── Pipeline ───────────────────────────────────────────────────
 async def run():
@@ -288,6 +377,20 @@ async def run():
         except Exception as e:
             print(f"  [ERROR] {entry['title'][:50]}: {e}")
             errors += 1
+
+    # resumen diario — solo si son las 8:00 ± 10 minutos
+    now = datetime.now(timezone.utc)
+    if now.hour == 8 and now.minute < 10:
+        summary_msg = get_daily_summary(con)
+        if summary_msg:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=summary_msg,
+                parse_mode="Markdown"
+            )
+            print("[SUMMARY] Resumen diario enviado.")
+        else:
+            print("[SUMMARY] Sin items hoy todavía.")
 
     print(f"\n[DONE] {sent} alertas enviadas, {errors} errores.")
     con.close()
