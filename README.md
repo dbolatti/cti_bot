@@ -27,6 +27,7 @@ Pipeline de Cyber Threat Intelligence (CTI) personal. Consume feeds RSS y APIs e
 | Schneier on Security | RSS | Análisis y política |
 | CISA KEV | JSON API | Vulnerabilidades explotadas activamente |
 | Abuse.ch URLhaus | REST API | URLs maliciosas activas |
+| Ransomware.live | REST API | Víctimas recientes por grupo ransomware |
 
 ## Sistema de prioridad
 

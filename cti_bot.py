@@ -205,6 +205,33 @@ async def fetch_urlhaus() -> list[dict]:
         })
     return items
 
+async def fetch_ransomware_live() -> list[dict]:
+    url = "https://api.ransomware.live/recentvictims"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    items = []
+    for victim in data[:15]:
+        group   = victim.get("group",    "unknown")
+        name    = victim.get("victim",   "unknown")
+        country = victim.get("country",  "N/A")
+        sector  = victim.get("activity", "N/A")
+        date    = victim.get("published", "")
+
+        vid = hashlib.md5(f"{group}_{name}_{date}".encode()).hexdigest()
+        items.append({
+            "id":     vid,
+            "title":  f"Víctima ransomware: {name} — {group}",
+            "desc":   (
+                f"Grupo: {group} | Víctima: {name} | "
+                f"País: {country} | Sector: {sector} | Fecha: {date}"
+            ),
+            "source": "Ransomware.live",
+            "link":   f"https://www.ransomware.live/group/{group.lower()}",
+        })
+    return items
 
 def fetch_rss(source: str, url: str) -> list[dict]:
     feed = feedparser.parse(url)
@@ -346,6 +373,13 @@ async def run():
         all_entries.extend(await fetch_urlhaus())
     except Exception as e:
         print(f"  [WARN] URLhaus: {e}")
+
+    # Ransomware.live
+    print("[FETCH] Ransomware.live")
+    try:
+        all_entries.extend(await fetch_ransomware_live())
+    except Exception as e:
+        print(f"  [WARN] Ransomware.live: {e}")
 
     # clasificación y envío (igual que antes)
     for entry in all_entries:
