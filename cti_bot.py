@@ -243,7 +243,7 @@ async def fetch_urlhaus() -> list[dict]:
     return items
 
 async def fetch_ransomware_live() -> list[dict]:
-    url = "https://api.ransomware.live/recentvictims"
+    url = "https://api.ransomware.live/v1/recentvictims"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url)
         resp.raise_for_status()
