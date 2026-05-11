@@ -1,0 +1,5 @@
+feedparser
+groq
+python-telegram-bot
+httpx
+python-dotenv
