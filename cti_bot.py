@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from groq import Groq
 from telegram import Bot
 from dotenv import load_dotenv
