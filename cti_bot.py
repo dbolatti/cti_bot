@@ -251,29 +251,39 @@ async def fetch_urlhaus() -> list[dict]:
         })
     return items
 
+
+#async def debug_ransomware_live():
+#    url = "https://api.ransomware.live/v1/recentvictims"
+#    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+#        resp = await client.get(url)
+#        print(f"Status: {resp.status_code}")
+#        data = resp.json()
+#        print(f"Total items: {len(data)}")
+#        if data:
+#            print("Primer item:")
+#            print(json.dumps(data[0], indent=2))
+
 async def fetch_ransomware_live() -> list[dict]:
     url = "https://api.ransomware.live/v1/recentvictims"
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
 
     items = []
     for victim in data[:15]:
-        group   = victim.get("group",    "unknown")
-        name    = victim.get("victim",   "unknown")
-        country = victim.get("country",  "N/A")
-        sector  = victim.get("activity", "N/A")
-        date    = victim.get("published", "")
+        group   = victim.get("group_name", "unknown")
+        name    = victim.get("post_title", "unknown")
+        country = victim.get("country",    "N/A")
+        sector  = victim.get("activity",   "N/A")
+        desc    = victim.get("description","")
+        date    = victim.get("published",  "")
 
         vid = hashlib.md5(f"{group}_{name}_{date}".encode()).hexdigest()
         items.append({
             "id":     vid,
             "title":  f"Víctima ransomware: {name} — {group}",
-            "desc":   (
-                f"Grupo: {group} | Víctima: {name} | "
-                f"País: {country} | Sector: {sector} | Fecha: {date}"
-            ),
+            "desc":   f"Grupo: {group} | Sector: {sector} | País: {country} | {desc[:300]}",
             "source": "Ransomware.live",
             "link":   f"https://www.ransomware.live/group/{group.lower()}",
         })
@@ -432,6 +442,9 @@ async def run():
 
     # ── Fetch todas las fuentes ───────────────────────────────
     all_entries = []
+
+    #Debugging...
+    #await debug_ransomware_live()
 
     for source, url in FEEDS.items():
         print(f"[FETCH] {source}")
