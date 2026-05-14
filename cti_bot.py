@@ -10,11 +10,19 @@ from telegram import Bot
 from dotenv import load_dotenv
 
 # ── Configuración ─────────────────────────────────────────────
-load_dotenv()   # lee el archivo .env y carga las variables
+load_dotenv()
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GROQ_API_KEY     = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+
+# ── Configuración de notificaciones ──────────────────────────
+SEND_PRIORITY_UP_TO  = int(os.getenv("SEND_PRIORITY_UP_TO", "2"))
+NOTIFY_MODE          = os.getenv("NOTIFY_MODE",   "realtime")   # realtime | hourly | daily | both
+NOTIFY_DETAIL        = os.getenv("NOTIFY_DETAIL", "compact")    # compact | detailed | minimal
+SME_ONLY             = os.getenv("SME_ONLY",      "false").lower() == "true"
+CATEGORIES           = [c.strip() for c in os.getenv("CATEGORIES", "").split(",") if c.strip()]
+DAILY_SUMMARY_HOUR   = int(os.getenv("DAILY_SUMMARY_HOUR", "8"))
 
 FEEDS = {
     # existentes
@@ -74,6 +82,30 @@ CIS_MAPPING = {
     ],
 }
 
+SOURCE_DEFAULTS = {
+    "Ransomware.live":  {
+        "category":    "ransomware",
+        "severity":    "high",
+        "sme_relevant": True,
+        "sme_reason":  "Ataque de ransomware activo — riesgo directo de cifrado de datos y extorsión",
+        "summary":     "",   # se completa dinámicamente
+    },
+    "CISA KEV": {
+        "category":    "vulnerability",
+        "severity":    "high",
+        "sme_relevant": True,
+        "sme_reason":  "Vulnerabilidad explotada activamente — requiere parcheo inmediato",
+        "summary":     "",
+    },
+    "Abuse.ch URLhaus": {
+        "category":    "malware",
+        "severity":    "high",
+        "sme_relevant": True,
+        "sme_reason":  "URL maliciosa activa — riesgo de infección por navegación o email",
+        "summary":     "",
+    },
+}
+
 def get_cis_controls(category: str) -> list[tuple]:
     return CIS_MAPPING.get(category, CIS_MAPPING["other"])
 
@@ -122,25 +154,41 @@ def save_item(con, item: dict):
 client_groq = Groq(api_key=GROQ_API_KEY)
 
 CLASSIFY_PROMPT = """\
-Sos un analista de ciberseguridad especializado en PyMEs.
-Clasificá el siguiente evento de seguridad y respondé ÚNICAMENTE con JSON válido.
-No agregues texto antes ni después del JSON.
+Sos un analista de ciberseguridad especializado en pequeñas y medianas empresas.
+Clasificá el siguiente evento y respondé ÚNICAMENTE con JSON válido, sin texto adicional.
 
 Título: {title}
 Descripción: {desc}
+
+Reglas para sme_reason:
+- Explicá el impacto técnico concreto, no menciones "PyME" ni "empresa"
+- Referenciá el control CIS v8 IG1 más relevante (ej: CIS-7.3, CIS-9.2)
+- Máximo una línea, directo al punto
+- Ejemplos buenos:
+  "CIS-7.3: parche crítico pendiente en software de uso masivo"
+  "CIS-9.2: campaña de phishing activa via email corporativo"
+  "CIS-8.1: malware con capacidad de movimiento lateral en red local"
+  "CIS-10.1: ransomware activo — evaluar estado de backups offline"
 
 Formato requerido:
 {{
   "category": "ransomware|phishing|exploit|malware|vulnerability|breach|other",
   "severity": "high|medium|low",
   "sme_relevant": true|false,
-  "sme_reason": "una línea explicando relevancia para PyMEs argentinas",
+  "sme_reason": "CIS-X.X: impacto técnico concreto en una línea",
   "summary": "resumen en máximo 2 líneas en español"
 }}"""
 
-def classify(title: str, desc: str) -> dict:
+def classify(title: str, desc: str, source: str = "") -> dict:
+    # bypass para fuentes con categoría conocida
+    if source in SOURCE_DEFAULTS:
+        result = SOURCE_DEFAULTS[source].copy()
+        result["summary"] = title[:120]
+        return result
+
+    # resto pasa por Groq
     resp = client_groq.chat.completions.create(
-        model="llama-3.3-70b-versatile",   # rápido y gratuito, suficiente para clasificación
+        model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "user",
@@ -151,11 +199,9 @@ def classify(title: str, desc: str) -> dict:
             }
         ],
         max_tokens=300,
-        temperature=0.1,   # bajo para respuestas consistentes
+        temperature=0.1,
     )
     raw = resp.choices[0].message.content.strip()
-
-    # limpieza defensiva por si el modelo agrega ```json ... ```
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -205,6 +251,18 @@ async def fetch_urlhaus() -> list[dict]:
         })
     return items
 
+
+#async def debug_ransomware_live():
+#    url = "https://api.ransomware.live/v1/recentvictims"
+#    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+#        resp = await client.get(url)
+#        print(f"Status: {resp.status_code}")
+#        data = resp.json()
+#        print(f"Total items: {len(data)}")
+#        if data:
+#            print("Primer item:")
+#            print(json.dumps(data[0], indent=2))
+
 async def fetch_ransomware_live() -> list[dict]:
     url = "https://api.ransomware.live/v1/recentvictims"
     async with httpx.AsyncClient(timeout=15) as client:
@@ -214,20 +272,18 @@ async def fetch_ransomware_live() -> list[dict]:
 
     items = []
     for victim in data[:15]:
-        group   = victim.get("group",    "unknown")
-        name    = victim.get("victim",   "unknown")
-        country = victim.get("country",  "N/A")
-        sector  = victim.get("activity", "N/A")
-        date    = victim.get("published", "")
+        group   = victim.get("group_name", "unknown")
+        name    = victim.get("post_title", "unknown")
+        country = victim.get("country",    "N/A")
+        sector  = victim.get("activity",   "N/A")
+        desc    = victim.get("description","")
+        date    = victim.get("published",  "")
 
         vid = hashlib.md5(f"{group}_{name}_{date}".encode()).hexdigest()
         items.append({
             "id":     vid,
             "title":  f"Víctima ransomware: {name} — {group}",
-            "desc":   (
-                f"Grupo: {group} | Víctima: {name} | "
-                f"País: {country} | Sector: {sector} | Fecha: {date}"
-            ),
+            "desc":   f"Grupo: {group} | Sector: {sector} | País: {country} | {desc[:300]}",
             "source": "Ransomware.live",
             "link":   f"https://www.ransomware.live/group/{group.lower()}",
         })
@@ -283,16 +339,48 @@ CATEGORY_LABEL = {
     "other":         "INFO",
 }
 
+def should_process(item: dict) -> bool:
+    if SME_ONLY and not item.get("sme_relevant"):
+        return False
+    if CATEGORIES and item.get("category") not in CATEGORIES:
+        return False
+    priority = get_priority(item)
+    if priority == 0 or priority > SEND_PRIORITY_UP_TO:
+        return False
+    return True
+
 def format_message(item: dict, priority: int) -> str:
     icon  = PRIORITY_ICON[priority]
     cat   = CATEGORY_LABEL.get(item["category"], "INFO")
     title = item["title"][:100]
-    sme   = item["sme_reason"][:120]
     link  = item.get("link", "")
 
-    controls = get_cis_controls(item["category"])
-    cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])  # máximo 2 en alerta
+    if NOTIFY_DETAIL == "minimal":
+        msg = f"{icon} *{title}* — {item['source']}"
+        if link:
+            msg += f"\n🔗 {link}"
+        return msg
 
+    if NOTIFY_DETAIL == "detailed":
+        controls = get_cis_controls(item["category"])
+        cis_line = "\n".join(f"  • `{c[0]}` {c[1]}" for c in controls)
+        sme = "✅ Relevante PyME" if item["sme_relevant"] else "➖ No prioritario"
+        msg = (
+            f"{icon} P{priority} · {cat} · {item['source']}\n"
+            f"*{title}*\n\n"
+            f"📋 {item.get('summary', '')[:200]}\n\n"
+            f"{sme}\n"
+            f"_{item['sme_reason'][:150]}_\n\n"
+            f"*Controles CIS IG1:*\n{cis_line}"
+        )
+        if link:
+            msg += f"\n\n🔗 {link}"
+        return msg
+
+    # compact (default)
+    controls = get_cis_controls(item["category"])
+    cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])
+    sme      = item["sme_reason"][:120]
     msg = (
         f"{icon} P{priority} · {cat} · {item['source']}\n"
         f"*{title}*\n"
@@ -346,13 +434,18 @@ def get_daily_summary(con) -> str | None:
 
 # ── Pipeline ───────────────────────────────────────────────────
 async def run():
-    con = init_db()
-    bot = Bot(token=TELEGRAM_TOKEN)
-    sent = 0
-    errors = 0
+    con      = init_db()
+    bot      = Bot(token=TELEGRAM_TOKEN)
+    sent     = 0
+    errors   = 0
+    now      = datetime.now(timezone.utc)
 
-    # RSS estándar
+    # ── Fetch todas las fuentes ───────────────────────────────
     all_entries = []
+
+    #Debugging...
+    #await debug_ransomware_live()
+
     for source, url in FEEDS.items():
         print(f"[FETCH] {source}")
         try:
@@ -360,50 +453,40 @@ async def run():
         except Exception as e:
             print(f"  [WARN] {source}: {e}")
 
-    # CISA KEV
     print("[FETCH] CISA KEV")
     try:
         all_entries.extend(await fetch_cisa_kev())
     except Exception as e:
         print(f"  [WARN] CISA KEV: {e}")
 
-    # Abuse.ch URLhaus
     print("[FETCH] Abuse.ch URLhaus")
     try:
         all_entries.extend(await fetch_urlhaus())
     except Exception as e:
         print(f"  [WARN] URLhaus: {e}")
 
-    # Ransomware.live
     print("[FETCH] Ransomware.live")
     try:
         all_entries.extend(await fetch_ransomware_live())
     except Exception as e:
         print(f"  [WARN] Ransomware.live: {e}")
 
-    # clasificación y envío (igual que antes)
+    # ── Clasificación ─────────────────────────────────────────
+    results = []
     for entry in all_entries:
         if is_seen(con, entry["id"]):
+            print(f"  [SKIP] {entry['title'][:60]}")
             continue
         try:
-            result = classify(entry["title"], entry["desc"])
+            result = classify(entry["title"], entry["desc"], source=entry["source"])
             result["id"]     = entry["id"]
             result["title"]  = entry["title"]
             result["source"] = entry["source"]
             result["link"]   = entry.get("link", "")
 
             print(f"  [{result['severity'].upper()}] {entry['title'][:60]}")
-
-            priority = get_priority(result)
-            if 1 <= priority <= SEND_PRIORITY_UP_TO:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=format_message(result, priority),
-                    parse_mode="Markdown"
-                )
-                sent += 1
-
             save_item(con, result)
+            results.append(result)
 
         except json.JSONDecodeError as e:
             print(f"  [ERROR] JSON inválido: {e}")
@@ -412,9 +495,28 @@ async def run():
             print(f"  [ERROR] {entry['title'][:50]}: {e}")
             errors += 1
 
-    # resumen diario — solo si son las 8:00 ± 10 minutos
-    now = datetime.now(timezone.utc)
-    if now.hour == 8 and now.minute < 10:
+    # ── Envío según NOTIFY_MODE ───────────────────────────────
+    send_realtime = NOTIFY_MODE in ("realtime", "both")
+    send_daily    = NOTIFY_MODE in ("daily", "both")
+    is_summary_hour = (now.hour == DAILY_SUMMARY_HOUR and now.minute < 10)
+
+    if send_realtime:
+        for result in results:
+            if not should_process(result):
+                continue
+            priority = get_priority(result)
+            try:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=format_message(result, priority),
+                    parse_mode="Markdown"
+                )
+                sent += 1
+            except Exception as e:
+                print(f"  [ERROR] send: {e}")
+                errors += 1
+
+    if send_daily and is_summary_hour:
         summary_msg = get_daily_summary(con)
         if summary_msg:
             await bot.send_message(
@@ -423,8 +525,6 @@ async def run():
                 parse_mode="Markdown"
             )
             print("[SUMMARY] Resumen diario enviado.")
-        else:
-            print("[SUMMARY] Sin items hoy todavía.")
 
     print(f"\n[DONE] {sent} alertas enviadas, {errors} errores.")
     con.close()
