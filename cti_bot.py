@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from groq import Groq
 from telegram import Bot
 from dotenv import load_dotenv
+import time
 
 # ── Configuración ─────────────────────────────────────────────
 load_dotenv()
@@ -132,21 +133,209 @@ def get_cis_controls(category: str) -> list[tuple]:
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-    CREATE TABLE IF NOT EXISTS items (
-        id          TEXT PRIMARY KEY,
-        title       TEXT,
-        source      TEXT,
-        category    TEXT,
-        severity    TEXT,
-        sme_flag    INTEGER,
-        sme_reason  TEXT,
-        cis_controls TEXT,
-        summary     TEXT,
-        ts          TEXT
+        CREATE TABLE IF NOT EXISTS items (
+            id           TEXT PRIMARY KEY,
+            title        TEXT,
+            source       TEXT,
+            category     TEXT,
+            severity     TEXT,
+            sme_flag     INTEGER,
+            sme_reason   TEXT,
+            cis_controls TEXT,
+            summary      TEXT,
+            ts           TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS user_config (
+            chat_id      TEXT PRIMARY KEY,
+            notify_mode  TEXT DEFAULT 'realtime',
+            notify_detail TEXT DEFAULT 'compact',
+            priority_max INTEGER DEFAULT 2,
+            sme_only     INTEGER DEFAULT 0,
+            categories   TEXT DEFAULT '',
+            updated_at   TEXT
         )
     """)
     con.commit()
     return con
+
+def get_user_config(con, chat_id: str) -> dict:
+    row = con.execute(
+        "SELECT * FROM user_config WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if not row:
+        # config por defecto
+        return {
+            "chat_id":      chat_id,
+            "notify_mode":  NOTIFY_MODE,
+            "notify_detail": NOTIFY_DETAIL,
+            "priority_max": SEND_PRIORITY_UP_TO,
+            "sme_only":     1 if SME_ONLY else 0,
+            "categories":   ",".join(CATEGORIES),
+        }
+    cols = ["chat_id","notify_mode","notify_detail","priority_max","sme_only","categories","updated_at"]
+    return dict(zip(cols, row))
+
+def save_user_config(con, chat_id: str, **kwargs):
+    existing = get_user_config(con, chat_id)
+    existing.update(kwargs)
+    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+    con.execute("""
+        INSERT OR REPLACE INTO user_config
+        (chat_id, notify_mode, notify_detail, priority_max, sme_only, categories, updated_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (
+        existing["chat_id"],
+        existing["notify_mode"],
+        existing["notify_detail"],
+        existing["priority_max"],
+        existing["sme_only"],
+        existing["categories"],
+        existing["updated_at"],
+    ))
+    con.commit()
+
+def should_process_for_user(item: dict, cfg: dict) -> bool:
+    if cfg["sme_only"] and not item.get("sme_relevant"):
+        return False
+    cats = [c.strip() for c in cfg["categories"].split(",") if c.strip()]
+    if cats and item.get("category") not in cats:
+        return False
+    priority = get_priority(item)
+    if priority == 0 or priority > cfg["priority_max"]:
+        return False
+    return True
+
+AYUDA_MSG = """
+*Comandos disponibles:*
+
+*Modo de notificación:*
+`/modo realtime` — alertas en tiempo real
+`/modo daily` — solo resumen diario
+`/modo both` — ambos
+
+*Detalle del mensaje:*
+`/detalle compact` — 4 líneas + link
+`/detalle detailed` — resumen completo + controles CIS
+`/detalle minimal` — solo título + link
+
+*Prioridad mínima:*
+`/prioridad 1` — solo crítico (P1)
+`/prioridad 2` — crítico + importante (P1+P2)
+`/prioridad 3` — todo
+
+*Filtros:*
+`/filtro ransomware,phishing` — solo esas categorías
+`/filtro off` — sin filtro
+`/sme on` — solo items con impacto operacional
+`/sme off` — todos los items
+
+*Info:*
+`/status` — ver tu configuración actual
+`/ayuda` — este mensaje
+"""
+
+async def handle_commands(bot, con):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        updates = resp.json().get("result", [])
+
+    if not updates:
+        return
+
+    last_id = updates[-1]["update_id"]
+
+    for update in updates:
+        msg = update.get("message", {})
+        if not msg:
+            continue
+        chat_id = str(msg["chat"]["id"])
+        text    = msg.get("text", "").strip().lower()
+
+        if not text.startswith("/"):
+            continue
+
+        parts = text.split()
+        cmd   = parts[0]
+        arg   = parts[1] if len(parts) > 1 else ""
+
+        reply = None
+
+        if cmd == "/ayuda":
+            reply = AYUDA_MSG
+
+        elif cmd == "/status":
+            cfg = get_user_config(con, chat_id)
+            cats = cfg["categories"] or "todas"
+            reply = (
+                f"*Tu configuración actual:*\n"
+                f"Modo: `{cfg['notify_mode']}`\n"
+                f"Detalle: `{cfg['notify_detail']}`\n"
+                f"Prioridad máx: `P{cfg['priority_max']}`\n"
+                f"Solo relevante: `{'sí' if cfg['sme_only'] else 'no'}`\n"
+                f"Categorías: `{cats}`"
+            )
+
+        elif cmd == "/modo":
+            if arg in ("realtime", "daily", "both"):
+                save_user_config(con, chat_id, notify_mode=arg)
+                reply = f"✅ Modo cambiado a `{arg}`"
+            else:
+                reply = "❌ Valores válidos: `realtime`, `daily`, `both`"
+
+        elif cmd == "/detalle":
+            if arg in ("compact", "detailed", "minimal"):
+                save_user_config(con, chat_id, notify_detail=arg)
+                reply = f"✅ Detalle cambiado a `{arg}`"
+            else:
+                reply = "❌ Valores válidos: `compact`, `detailed`, `minimal`"
+
+        elif cmd == "/prioridad":
+            if arg in ("1", "2", "3"):
+                save_user_config(con, chat_id, priority_max=int(arg))
+                reply = f"✅ Prioridad máxima: `P{arg}`"
+            else:
+                reply = "❌ Valores válidos: `1`, `2`, `3`"
+
+        elif cmd == "/filtro":
+            if arg == "off":
+                save_user_config(con, chat_id, categories="")
+                reply = "✅ Filtro de categorías desactivado"
+            else:
+                valid = {"ransomware","phishing","exploit","malware","vulnerability","breach","other"}
+                cats  = [c.strip() for c in arg.split(",") if c.strip() in valid]
+                if cats:
+                    save_user_config(con, chat_id, categories=",".join(cats))
+                    reply = f"✅ Filtrando: `{', '.join(cats)}`"
+                else:
+                    reply = "❌ Categorías válidas: ransomware, phishing, exploit, malware, vulnerability, breach, other"
+
+        elif cmd == "/sme":
+            if arg == "on":
+                save_user_config(con, chat_id, sme_only=1)
+                reply = "✅ Solo items con impacto operacional"
+            elif arg == "off":
+                save_user_config(con, chat_id, sme_only=0)
+                reply = "✅ Mostrando todos los items"
+            else:
+                reply = "❌ Valores válidos: `on`, `off`"
+
+        if reply:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=reply,
+                parse_mode="Markdown"
+            )
+
+    # marcar updates como procesados
+    if last_id:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": last_id + 1}
+            )
 
 def is_seen(con, item_id: str) -> bool:
     return con.execute(
@@ -207,7 +396,8 @@ def classify(title: str, desc: str, source: str = "") -> dict:
 
     # resto pasa por Groq
     resp = client_groq.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        #model="llama-3.3-70b-versatile",
+        model="llama3-8b-8192"
         messages=[
             {
                 "role": "user",
@@ -225,6 +415,7 @@ def classify(title: str, desc: str, source: str = "") -> dict:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
+    time.sleep(0.3)
     return json.loads(raw.strip())
 
 
@@ -243,7 +434,7 @@ async def fetch_epss_high() -> list[dict]:
 
     items = []
     async with httpx.AsyncClient(timeout=15) as client:
-        for entry in epss_data:
+        for entry in epss_data[:8]:
             cve   = entry.get("cve", "")
             score = float(entry.get("epss", 0))
             pct   = float(entry.get("percentile", 0))
@@ -254,9 +445,29 @@ async def fetch_epss_high() -> list[dict]:
             cvss     = "N/A"
             nvd_desc = ""
 
+            configs = vuln.get("configurations", [])
+            for config in configs:
+                for node in config.get("nodes", []):
+                    cpe_list = node.get("cpeMatch", [])
+                    if cpe_list:
+                        cpe   = cpe_list[0].get("criteria", "")
+                        parts = cpe.split(":")
+                        if len(parts) >= 5:
+                            vendor  = parts[3].replace("_", " ").title()
+                            product = parts[4].replace("_", " ").title()
+                        break
+                if vendor != "N/A":
+                    break
+
             try:
                 nvd_url  = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}"
-                nvd_resp = await client.get(nvd_url)
+                
+                headers = {}
+                nvd_key = os.getenv("NVD_API_KEY")
+                if nvd_key:
+                    headers["apiKey"] = nvd_key
+                nvd_resp = await client.get(nvd_url, headers=headers)
+
                 if nvd_resp.status_code == 200:
                     nvd_data = nvd_resp.json()
                     vuln     = nvd_data.get("vulnerabilities", [{}])[0].get("cve", {})
@@ -366,7 +577,7 @@ async def fetch_ransomware_live() -> list[dict]:
         data = resp.json()
 
     items = []
-    for victim in data[:15]:
+    for victim in data[:8]:
         group   = victim.get("group_name", "unknown")
         name    = victim.get("post_title", "unknown")
         country = victim.get("country",    "N/A")
@@ -387,7 +598,7 @@ async def fetch_ransomware_live() -> list[dict]:
 def fetch_rss(source: str, url: str) -> list[dict]:
     feed = feedparser.parse(url)
     items = []
-    for entry in feed.entries[:8]:
+    for entry in feed.entries[:5]:
         link = entry.get("link", entry.get("id", url))
         items.append({
             "id":    hashlib.md5(link.encode()).hexdigest(),
@@ -444,7 +655,7 @@ def should_process(item: dict) -> bool:
         return False
     return True
 
-def format_message(item: dict, priority: int) -> str:
+def format_message_for(item: dict, priority: int, detail: str = "compact") -> str:
     icon  = PRIORITY_ICON[priority]
     cat   = CATEGORY_LABEL.get(item["category"], "INFO")
     title = item["title"][:100]
@@ -529,11 +740,14 @@ def get_daily_summary(con) -> str | None:
 
 # ── Pipeline ───────────────────────────────────────────────────
 async def run():
-    con      = init_db()
-    bot      = Bot(token=TELEGRAM_TOKEN)
-    sent     = 0
-    errors   = 0
-    now      = datetime.now(timezone.utc)
+    con     = init_db()
+    bot     = Bot(token=TELEGRAM_TOKEN)
+    sent    = 0
+    errors  = 0
+    now     = datetime.now(timezone.utc)
+
+    # ── Procesar comandos entrantes ───────────────────────────
+    await handle_commands(bot, con)
 
     # ── Fetch todas las fuentes ───────────────────────────────
     all_entries = []
@@ -596,43 +810,52 @@ async def run():
             print(f"  [ERROR] {entry['title'][:50]}: {e}")
             errors += 1
 
-    # ── Envío según NOTIFY_MODE ───────────────────────────────
-    send_realtime = NOTIFY_MODE in ("realtime", "both")
-    send_daily    = NOTIFY_MODE in ("daily", "both")
+    # ── Envío por usuario ─────────────────────────────────────
     is_summary_hour = (now.hour == DAILY_SUMMARY_HOUR and now.minute < 10)
 
-    if send_realtime:
-        for result in results:
-            if not should_process(result):
-                continue
-            priority = get_priority(result)
-            for attempt in range(3):   # hasta 3 intentos
-                try:
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=format_message(result, priority),
-                        parse_mode="Markdown"
-                    )
-                    sent += 1
-                    await asyncio.sleep(0.5)   # 0.5s entre mensajes
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        print(f"  [RETRY {attempt+1}] {str(e)[:50]}")
-                        await asyncio.sleep(2 ** attempt)   # backoff: 1s, 2s
-                    else:
-                        print(f"  [ERROR] send definitivo: {str(e)[:50]}")
-                        errors += 1
+    # todos los usuarios registrados + owner del .env
+    chat_ids = set([TELEGRAM_CHAT_ID])
+    rows = con.execute("SELECT chat_id FROM user_config").fetchall()
+    for row in rows:
+        chat_ids.add(row[0])
 
-    if send_daily and is_summary_hour:
-        summary_msg = get_daily_summary(con)
-        if summary_msg:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=summary_msg,
-                parse_mode="Markdown"
-            )
-            print("[SUMMARY] Resumen diario enviado.")
+    for chat_id in chat_ids:
+        cfg  = get_user_config(con, chat_id)
+        mode = cfg["notify_mode"]
+
+        if mode in ("realtime", "both"):
+            for result in results:
+                if not should_process_for_user(result, cfg):
+                    continue
+                priority = get_priority(result)
+                msg = format_message_for(result, priority, cfg["notify_detail"])
+                for attempt in range(3):
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=msg,
+                            parse_mode="Markdown"
+                        )
+                        sent += 1
+                        await asyncio.sleep(0.5)
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"  [RETRY {attempt+1}] {str(e)[:50]}")
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            print(f"  [ERROR] send definitivo: {str(e)[:50]}")
+                            errors += 1
+
+        if mode in ("daily", "both") and is_summary_hour:
+            summary_msg = get_daily_summary(con)
+            if summary_msg:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=summary_msg,
+                    parse_mode="Markdown"
+                )
+                print(f"  [SUMMARY] Resumen diario enviado a {chat_id}")
 
     print(f"\n[DONE] {sent} alertas enviadas, {errors} errores.")
     con.close()
