@@ -39,6 +39,11 @@ FEEDS = {
     "Malwarebytes Labs":  "https://www.malwarebytes.com/blog/feed/",
     "Cisco Talos":        "https://blog.talosintelligence.com/feeds/posts/default",
     "Unit 42":            "https://unit42.paloaltonetworks.com/feed/",
+    
+    # nuevos_2
+    "ThreatPost":        "https://threatpost.com/feed/",
+    "Dark Reading":      "https://www.darkreading.com/rss.xml",
+    "CERT/CC":           "https://www.kb.cert.org/feeds/cert-kb-latest.xml",
 }
 
 DB_PATH = "cti.db"
@@ -103,6 +108,20 @@ SOURCE_DEFAULTS = {
         "sme_relevant": True,
         "sme_reason":  "URL maliciosa activa — riesgo de infección por navegación o email",
         "summary":     "",
+    },
+    "EPSS/FIRST": {
+    "category":     "vulnerability",
+    "severity":     "high",
+    "sme_relevant":  True,
+    "sme_reason":   "CIS-7.1: CVE con alta probabilidad de explotación activa — priorizar parcheo",
+    "summary":      "",
+    },
+    "CERT/CC": {
+        "category":     "vulnerability",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "CIS-7.3: advisory oficial — verificar aplicabilidad en software instalado",
+        "summary":      "",
     },
 }
 
@@ -212,6 +231,34 @@ def classify(title: str, desc: str, source: str = "") -> dict:
 # ── Fetch RSS ──────────────────────────────────────────────────
 
 import httpx
+
+async def fetch_epss_high() -> list[dict]:
+    """Obtiene CVEs con EPSS score alto (> 0.7) de los últimos 7 días."""
+    url = "https://api.first.org/data/v1/epss?epss-gt=0.7&order=!epss&limit=10"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    items = []
+    for entry in data.get("data", []):
+        cve      = entry.get("cve", "")
+        score    = float(entry.get("epss", 0))
+        pct      = float(entry.get("percentile", 0))
+
+        vid = hashlib.md5(cve.encode()).hexdigest()
+        items.append({
+            "id":     vid,
+            "title":  f"{cve} — EPSS {score:.2%} (percentil {pct:.0%})",
+            "desc":   (
+                f"CVE: {cve} | EPSS score: {score:.4f} | "
+                f"Percentil: {pct:.2%} | "
+                f"Alta probabilidad de explotación activa en los próximos 30 días"
+            ),
+            "source": "EPSS/FIRST",
+            "link":   f"https://nvd.nist.gov/vuln/detail/{cve}",
+        })
+    return items
 
 async def fetch_cisa_kev() -> list[dict]:
     url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -470,6 +517,12 @@ async def run():
         all_entries.extend(await fetch_ransomware_live())
     except Exception as e:
         print(f"  [WARN] Ransomware.live: {e}")
+
+    print("[FETCH] EPSS/FIRST")
+    try:
+        all_entries.extend(await fetch_epss_high())
+    except Exception as e:
+        print(f"  [WARN] EPSS: {e}")
 
     # ── Clasificación ─────────────────────────────────────────
     results = []
