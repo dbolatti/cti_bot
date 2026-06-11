@@ -233,31 +233,79 @@ def classify(title: str, desc: str, source: str = "") -> dict:
 import httpx
 
 async def fetch_epss_high() -> list[dict]:
-    """Obtiene CVEs con EPSS score alto (> 0.7) de los últimos 7 días."""
-    url = "https://api.first.org/data/v1/epss?epss-gt=0.7&order=!epss&limit=10"
+    """CVEs con EPSS score > 0.7, enriquecidos con descripción de NVD."""
+    epss_url = "https://api.first.org/data/v1/epss?epss-gt=0.7&order=!epss&limit=10"
+
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url)
+        resp = await client.get(epss_url)
         resp.raise_for_status()
-        data = resp.json()
+        epss_data = resp.json().get("data", [])
 
     items = []
-    for entry in data.get("data", []):
-        cve      = entry.get("cve", "")
-        score    = float(entry.get("epss", 0))
-        pct      = float(entry.get("percentile", 0))
+    async with httpx.AsyncClient(timeout=15) as client:
+        for entry in epss_data:
+            cve   = entry.get("cve", "")
+            score = float(entry.get("epss", 0))
+            pct   = float(entry.get("percentile", 0))
 
-        vid = hashlib.md5(cve.encode()).hexdigest()
-        items.append({
-            "id":     vid,
-            "title":  f"{cve} — EPSS {score:.2%} (percentil {pct:.0%})",
-            "desc":   (
-                f"CVE: {cve} | EPSS score: {score:.4f} | "
-                f"Percentil: {pct:.2%} | "
-                f"Alta probabilidad de explotación activa en los próximos 30 días"
-            ),
-            "source": "EPSS/FIRST",
-            "link":   f"https://nvd.nist.gov/vuln/detail/{cve}",
-        })
+            # enriquecimiento desde NVD
+            vendor   = "N/A"
+            product  = "N/A"
+            cvss     = "N/A"
+            nvd_desc = ""
+
+            try:
+                nvd_url  = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}"
+                nvd_resp = await client.get(nvd_url)
+                if nvd_resp.status_code == 200:
+                    nvd_data = nvd_resp.json()
+                    vuln     = nvd_data.get("vulnerabilities", [{}])[0].get("cve", {})
+
+                    # descripción en inglés
+                    for d in vuln.get("descriptions", []):
+                        if d.get("lang") == "en":
+                            nvd_desc = d.get("value", "")[:300]
+                            break
+
+                    # vendor y producto
+                    cpe_list = (
+                        vuln.get("configurations", [{}])[0]
+                            .get("nodes", [{}])[0]
+                            .get("cpeMatch", [])
+                    )
+                    if cpe_list:
+                        cpe = cpe_list[0].get("criteria", "")
+                        # formato: cpe:2.3:a:vendor:product:...
+                        parts = cpe.split(":")
+                        if len(parts) >= 5:
+                            vendor  = parts[3].replace("_", " ").title()
+                            product = parts[4].replace("_", " ").title()
+
+                    # CVSS score
+                    metrics = vuln.get("metrics", {})
+                    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                        if key in metrics:
+                            cvss = metrics[key][0]["cvssData"].get("baseScore", "N/A")
+                            break
+
+                await asyncio.sleep(0.7)   # NVD rate limit: ~100 req/min sin API key
+
+            except Exception as e:
+                print(f"  [WARN] NVD enrich {cve}: {e}")
+
+            vid = hashlib.md5(cve.encode()).hexdigest()
+            items.append({
+                "id":    vid,
+                "title": f"{cve} — {product} ({vendor}) · EPSS {score:.1%}",
+                "desc":  (
+                    f"CVE: {cve} | Producto: {product} | Vendor: {vendor} | "
+                    f"CVSS: {cvss} | EPSS: {score:.4f} (percentil {pct:.0%}) | "
+                    f"{nvd_desc}"
+                ),
+                "source": "EPSS/FIRST",
+                "link":   f"https://nvd.nist.gov/vuln/detail/{cve}",
+            })
+
     return items
 
 async def fetch_cisa_kev() -> list[dict]:
