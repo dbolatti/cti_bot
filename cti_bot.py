@@ -558,16 +558,23 @@ async def run():
             if not should_process(result):
                 continue
             priority = get_priority(result)
-            try:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=format_message(result, priority),
-                    parse_mode="Markdown"
-                )
-                sent += 1
-            except Exception as e:
-                print(f"  [ERROR] send: {e}")
-                errors += 1
+            for attempt in range(3):   # hasta 3 intentos
+                try:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_message(result, priority),
+                        parse_mode="Markdown"
+                    )
+                    sent += 1
+                    await asyncio.sleep(0.5)   # 0.5s entre mensajes
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        print(f"  [RETRY {attempt+1}] {str(e)[:50]}")
+                        await asyncio.sleep(2 ** attempt)   # backoff: 1s, 2s
+                    else:
+                        print(f"  [ERROR] send definitivo: {str(e)[:50]}")
+                        errors += 1
 
     if send_daily and is_summary_hour:
         summary_msg = get_daily_summary(con)
