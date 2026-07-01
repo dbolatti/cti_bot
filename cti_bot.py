@@ -1,22 +1,36 @@
 import feedparser
+import html
 import sqlite3
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from groq import Groq
 from telegram import Bot
 from dotenv import load_dotenv
-import time
 
-# Ensure the console handles UTF-8 (Cyrillic, CJK, etc.) without crashing on Windows
+# ── Consola UTF-8 (Windows) ────────────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# ── Logging ────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler("cti_bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 # ── Configuración ─────────────────────────────────────────────
 load_dotenv()
@@ -47,37 +61,30 @@ def validate_config():
 
 # ── Configuración de notificaciones ──────────────────────────
 SEND_PRIORITY_UP_TO  = int(os.getenv("SEND_PRIORITY_UP_TO", "2"))
-NOTIFY_MODE          = os.getenv("NOTIFY_MODE",   "realtime")   # realtime | hourly | daily | both
+NOTIFY_MODE          = os.getenv("NOTIFY_MODE",   "realtime")   # realtime | daily | both
 NOTIFY_DETAIL        = os.getenv("NOTIFY_DETAIL", "compact")    # compact | detailed | minimal
 SME_ONLY             = os.getenv("SME_ONLY",      "false").lower() == "true"
 CATEGORIES           = [c.strip() for c in os.getenv("CATEGORIES", "").split(",") if c.strip()]
 DAILY_SUMMARY_HOUR   = int(os.getenv("DAILY_SUMMARY_HOUR", "8"))
 
 FEEDS = {
-    # existentes
-    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
-    "TheHackerNews":    "https://feeds.feedburner.com/TheHackersNews",
-    "ENISA":            "https://www.enisa.europa.eu/topics/cyber-threats/threats-and-trends/rss",
-    "Schneier":         "https://www.schneier.com/feed/atom/",
-    "SANS ISC":         "https://isc.sans.edu/rssfeed_full.xml",
-
-    # nuevos
+    "BleepingComputer":   "https://www.bleepingcomputer.com/feed/",
+    "TheHackerNews":      "https://feeds.feedburner.com/TheHackersNews",
+    "ENISA":              "https://www.enisa.europa.eu/topics/cyber-threats/threats-and-trends/rss",
+    "Schneier":           "https://www.schneier.com/feed/atom/",
+    "SANS ISC":           "https://isc.sans.edu/rssfeed_full.xml",
     "Krebs on Security":  "https://krebsonsecurity.com/feed/",
     "Recorded Future":    "https://therecord.media/feed",
     "Securelist":         "https://securelist.com/feed/",
     "Malwarebytes Labs":  "https://www.malwarebytes.com/blog/feed/",
     "Cisco Talos":        "https://blog.talosintelligence.com/feeds/posts/default",
     "Unit 42":            "https://unit42.paloaltonetworks.com/feed/",
-    
-    # nuevos_2
-    "ThreatPost":        "https://threatpost.com/feed/",
-    "Dark Reading":      "https://www.darkreading.com/rss.xml",
-    "CERT/CC":           "https://www.kb.cert.org/feeds/cert-kb-latest.xml",
+    "ThreatPost":         "https://threatpost.com/feed/",
+    "Dark Reading":       "https://www.darkreading.com/rss.xml",
+    "CERT/CC":            "https://www.kb.cert.org/feeds/cert-kb-latest.xml",
 }
 
 DB_PATH = "cti.db"
-# qué prioridades enviar: 1, 2, o 3
-SEND_PRIORITY_UP_TO = 2
 
 # Mapeo categoría → controles CIS v8 IG1 relevantes
 CIS_MAPPING = {
@@ -117,33 +124,33 @@ CIS_MAPPING = {
 }
 
 SOURCE_DEFAULTS = {
-    "Ransomware.live":  {
-        "category":    "ransomware",
-        "severity":    "high",
-        "sme_relevant": True,
-        "sme_reason":  "Ataque de ransomware activo — riesgo directo de cifrado de datos y extorsión",
-        "summary":     "",   # se completa dinámicamente
+    "Ransomware.live": {
+        "category":     "ransomware",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "Ataque de ransomware activo — riesgo directo de cifrado de datos y extorsión",
+        "summary":      "",
     },
     "CISA KEV": {
-        "category":    "vulnerability",
-        "severity":    "high",
-        "sme_relevant": True,
-        "sme_reason":  "Vulnerabilidad explotada activamente — requiere parcheo inmediato",
-        "summary":     "",
+        "category":     "vulnerability",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "Vulnerabilidad explotada activamente — requiere parcheo inmediato",
+        "summary":      "",
     },
     "Abuse.ch URLhaus": {
-        "category":    "malware",
-        "severity":    "high",
-        "sme_relevant": True,
-        "sme_reason":  "URL maliciosa activa — riesgo de infección por navegación o email",
-        "summary":     "",
+        "category":     "malware",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "URL maliciosa activa — riesgo de infección por navegación o email",
+        "summary":      "",
     },
     "EPSS/FIRST": {
-    "category":     "vulnerability",
-    "severity":     "high",
-    "sme_relevant":  True,
-    "sme_reason":   "CIS-7.1: CVE con alta probabilidad de explotación activa — priorizar parcheo",
-    "summary":      "",
+        "category":     "vulnerability",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "CIS-7.1: CVE con alta probabilidad de explotación activa — priorizar parcheo",
+        "summary":      "",
     },
     "CERT/CC": {
         "category":     "vulnerability",
@@ -156,6 +163,10 @@ SOURCE_DEFAULTS = {
 
 def get_cis_controls(category: str) -> list[tuple]:
     return CIS_MAPPING.get(category, CIS_MAPPING["other"])
+
+def clean_text(text: str) -> str:
+    """Decode HTML entities and strip whitespace from external feed text."""
+    return html.unescape(text).strip()
 
 # ── Base de datos ─────────────────────────────────────────────
 def init_db():
@@ -176,34 +187,46 @@ def init_db():
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS user_config (
-            chat_id      TEXT PRIMARY KEY,
-            notify_mode  TEXT DEFAULT 'realtime',
-            notify_detail TEXT DEFAULT 'compact',
-            priority_max INTEGER DEFAULT 2,
-            sme_only     INTEGER DEFAULT 0,
-            categories   TEXT DEFAULT '',
-            updated_at   TEXT
+            chat_id            TEXT PRIMARY KEY,
+            notify_mode        TEXT DEFAULT 'realtime',
+            notify_detail      TEXT DEFAULT 'compact',
+            priority_max       INTEGER DEFAULT 2,
+            sme_only           INTEGER DEFAULT 0,
+            categories         TEXT DEFAULT '',
+            updated_at         TEXT,
+            last_daily_summary TEXT DEFAULT ''
         )
     """)
+    # migration: add column to DBs created before this column existed
+    try:
+        con.execute("ALTER TABLE user_config ADD COLUMN last_daily_summary TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     con.commit()
     return con
 
+_USER_CONFIG_COLS = [
+    "chat_id", "notify_mode", "notify_detail", "priority_max",
+    "sme_only", "categories", "updated_at", "last_daily_summary",
+]
+
 def get_user_config(con, chat_id: str) -> dict:
     row = con.execute(
-        "SELECT * FROM user_config WHERE chat_id=?", (chat_id,)
+        "SELECT chat_id, notify_mode, notify_detail, priority_max, sme_only, "
+        "categories, updated_at, last_daily_summary FROM user_config WHERE chat_id=?",
+        (chat_id,)
     ).fetchone()
     if not row:
-        # config por defecto
         return {
-            "chat_id":      chat_id,
-            "notify_mode":  NOTIFY_MODE,
-            "notify_detail": NOTIFY_DETAIL,
-            "priority_max": SEND_PRIORITY_UP_TO,
-            "sme_only":     1 if SME_ONLY else 0,
-            "categories":   ",".join(CATEGORIES),
+            "chat_id":            chat_id,
+            "notify_mode":        NOTIFY_MODE,
+            "notify_detail":      NOTIFY_DETAIL,
+            "priority_max":       SEND_PRIORITY_UP_TO,
+            "sme_only":           1 if SME_ONLY else 0,
+            "categories":         ",".join(CATEGORIES),
+            "last_daily_summary": "",
         }
-    cols = ["chat_id","notify_mode","notify_detail","priority_max","sme_only","categories","updated_at"]
-    return dict(zip(cols, row))
+    return dict(zip(_USER_CONFIG_COLS, row))
 
 def save_user_config(con, chat_id: str, **kwargs):
     existing = get_user_config(con, chat_id)
@@ -211,8 +234,9 @@ def save_user_config(con, chat_id: str, **kwargs):
     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
     con.execute("""
         INSERT OR REPLACE INTO user_config
-        (chat_id, notify_mode, notify_detail, priority_max, sme_only, categories, updated_at)
-        VALUES (?,?,?,?,?,?,?)
+        (chat_id, notify_mode, notify_detail, priority_max, sme_only,
+         categories, updated_at, last_daily_summary)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (
         existing["chat_id"],
         existing["notify_mode"],
@@ -221,6 +245,7 @@ def save_user_config(con, chat_id: str, **kwargs):
         existing["sme_only"],
         existing["categories"],
         existing["updated_at"],
+        existing.get("last_daily_summary", ""),
     ))
     con.commit()
 
@@ -285,9 +310,8 @@ async def handle_commands(bot, con):
         if not text.startswith("/"):
             continue
 
-        # solo chat_ids autorizados pueden controlar el bot / quedar suscriptos a alertas
         if chat_id not in ALLOWED_CHAT_IDS:
-            print(f"  [SECURITY] comando ignorado de chat_id no autorizado: {chat_id}")
+            logger.warning(f"comando ignorado de chat_id no autorizado: {chat_id}")
             continue
 
         parts = text.split()
@@ -337,7 +361,8 @@ async def handle_commands(bot, con):
                 save_user_config(con, chat_id, categories="")
                 reply = "✅ Filtro de categorías desactivado"
             else:
-                valid = {"ransomware","phishing","exploit","malware","vulnerability","breach","other"}
+                valid = {"ransomware", "phishing", "exploit", "malware",
+                         "vulnerability", "breach", "other"}
                 cats  = [c.strip() for c in arg.split(",") if c.strip() in valid]
                 if cats:
                     save_user_config(con, chat_id, categories=",".join(cats))
@@ -445,47 +470,52 @@ def validate_classification(result: dict) -> dict:
     return result
 
 def classify(title: str, desc: str, source: str = "") -> dict:
-    # bypass para fuentes con categoría conocida
     if source in SOURCE_DEFAULTS:
         result = SOURCE_DEFAULTS[source].copy()
         result["summary"] = title[:120]
         return validate_classification(result)
 
-    # resto pasa por Groq
-    resp = client_groq.chat.completions.create(
-        #model="llama-3.3-70b-versatile",
-        model="llama-3.1-8b-instant",
-        messages=[
-            {
-                "role": "user",
-                "content": CLASSIFY_PROMPT.format(
-                    title=title,
-                    desc=desc[:600]
-                )
-            }
-        ],
-        max_tokens=300,
-        temperature=0.1,
-    )
-    raw = resp.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    time.sleep(0.3)
-    result = json.loads(raw.strip())
-    return validate_classification(result)
+    for attempt in range(2):
+        try:
+            resp = client_groq.chat.completions.create(
+                #model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": CLASSIFY_PROMPT.format(
+                            title=title,
+                            desc=desc[:600]
+                        )
+                    }
+                ],
+                max_tokens=300,
+                temperature=0.0 if attempt > 0 else 0.1,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            time.sleep(0.3)
+            result = json.loads(raw.strip())
+            return validate_classification(result)
+        except json.JSONDecodeError:
+            if attempt == 0:
+                logger.warning(f"JSON inválido en classify(), reintentando con temperature=0: {title[:40]!r}")
+                continue
+            raise
 
-
-# ── Fetch RSS ──────────────────────────────────────────────────
-
+# ── Fetch de fuentes ───────────────────────────────────────────
 import httpx
 
 CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 async def fetch_epss_high() -> list[dict]:
-    """CVEs con EPSS score > 0.7, enriquecidos con descripción de NVD."""
-    epss_url = "https://api.first.org/data/v1/epss?epss-gt=0.7&order=!epss&limit=10"
+    """CVEs con EPSS score > 0.7, enriquecidos con vendor/producto/CVSS desde NVD."""
+    epss_url  = "https://api.first.org/data/v1/epss?epss-gt=0.7&order=!epss&limit=10"
+    # NVD rate limit: 5 req/30s sin API key (6s entre llamadas), 50/30s con key (0.6s)
+    nvd_delay = 0.6 if os.getenv("NVD_API_KEY") else 6.0
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(epss_url)
@@ -499,74 +529,79 @@ async def fetch_epss_high() -> list[dict]:
             score = float(entry.get("epss", 0))
             pct   = float(entry.get("percentile", 0))
 
-            # enriquecimiento desde NVD
             vendor   = "N/A"
             product  = "N/A"
             cvss     = "N/A"
             nvd_desc = ""
 
             if not CVE_RE.match(cve):
-                print(f"  [WARN] CVE con formato inválido, se omite enriquecimiento: {cve!r}")
+                logger.warning(f"CVE con formato inválido, se omite enriquecimiento: {cve!r}")
                 vid = hashlib.md5(cve.encode()).hexdigest()
                 items.append({
-                    "id":    vid,
-                    "title": f"{cve} — EPSS {score:.1%}",
-                    "desc":  f"CVE: {cve} | EPSS: {score:.4f} (percentil {pct:.0%})",
+                    "id":     vid,
+                    "title":  f"{cve} — EPSS {score:.1%}",
+                    "desc":   f"CVE: {cve} | EPSS: {score:.4f} (percentil {pct:.0%})",
                     "source": "EPSS/FIRST",
                     "link":   "https://nvd.nist.gov/vuln/search",
                 })
                 continue
 
             try:
-                nvd_url  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-
                 headers = {}
                 nvd_key = os.getenv("NVD_API_KEY")
                 if nvd_key:
                     headers["apiKey"] = nvd_key
-                nvd_resp = await client.get(nvd_url, params={"cveId": cve}, headers=headers)
+                nvd_resp = await client.get(
+                    "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                    params={"cveId": cve},
+                    headers=headers,
+                )
 
                 if nvd_resp.status_code == 200:
                     nvd_data = nvd_resp.json()
                     vuln     = nvd_data.get("vulnerabilities", [{}])[0].get("cve", {})
 
-                    # descripción en inglés
                     for d in vuln.get("descriptions", []):
                         if d.get("lang") == "en":
                             nvd_desc = d.get("value", "")[:300]
                             break
 
-                    # vendor y producto
                     cpe_list = (
                         vuln.get("configurations", [{}])[0]
                             .get("nodes", [{}])[0]
                             .get("cpeMatch", [])
                     )
                     if cpe_list:
-                        cpe = cpe_list[0].get("criteria", "")
-                        # formato: cpe:2.3:a:vendor:product:...
+                        cpe   = cpe_list[0].get("criteria", "")
                         parts = cpe.split(":")
                         if len(parts) >= 5:
                             vendor  = parts[3].replace("_", " ").title()
                             product = parts[4].replace("_", " ").title()
 
-                    # CVSS score
                     metrics = vuln.get("metrics", {})
                     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                         if key in metrics:
                             cvss = metrics[key][0]["cvssData"].get("baseScore", "N/A")
                             break
+                else:
+                    logger.warning(f"NVD respondió {nvd_resp.status_code} para {cve}")
 
-                await asyncio.sleep(0.7)   # NVD rate limit: ~100 req/min sin API key
+                await asyncio.sleep(nvd_delay)
 
             except Exception as e:
-                print(f"  [WARN] NVD enrich {cve}: {e}")
+                logger.warning(f"NVD enrich {cve}: {e}")
+
+            # fallback: si no hay vendor/product usar el inicio de la descripción de NVD
+            if vendor == "N/A" and nvd_desc:
+                title_suffix = nvd_desc[:60]
+            else:
+                title_suffix = f"{product} ({vendor})"
 
             vid = hashlib.md5(cve.encode()).hexdigest()
             items.append({
-                "id":    vid,
-                "title": f"{cve} — {product} ({vendor}) · EPSS {score:.1%}",
-                "desc":  (
+                "id":     vid,
+                "title":  f"{cve} — {title_suffix} · EPSS {score:.1%}",
+                "desc":   (
                     f"CVE: {cve} | Producto: {product} | Vendor: {vendor} | "
                     f"CVSS: {cvss} | EPSS: {score:.4f} (percentil {pct:.0%}) | "
                     f"{nvd_desc}"
@@ -588,8 +623,8 @@ async def fetch_cisa_kev() -> list[dict]:
         vid = vuln["cveID"]
         items.append({
             "id":     hashlib.md5(vid.encode()).hexdigest(),
-            "title":  f"{vid} — {vuln['vulnerabilityName']}",
-            "desc":   f"{vuln['shortDescription']} Acción requerida: {vuln['requiredAction']}",
+            "title":  clean_text(f"{vid} — {vuln['vulnerabilityName']}"),
+            "desc":   clean_text(f"{vuln['shortDescription']} Acción requerida: {vuln['requiredAction']}"),
             "source": "CISA KEV",
             "link":   f"https://nvd.nist.gov/vuln/detail/{vid}",
         })
@@ -615,18 +650,6 @@ async def fetch_urlhaus() -> list[dict]:
         })
     return items
 
-
-#async def debug_ransomware_live():
-#    url = "https://api.ransomware.live/v1/recentvictims"
-#    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-#        resp = await client.get(url)
-#        print(f"Status: {resp.status_code}")
-#        data = resp.json()
-#        print(f"Total items: {len(data)}")
-#        if data:
-#            print("Primer item:")
-#            print(json.dumps(data[0], indent=2))
-
 async def fetch_ransomware_live() -> list[dict]:
     url = "https://api.ransomware.live/v1/recentvictims"
     async with httpx.AsyncClient(timeout=15) as client:
@@ -640,8 +663,8 @@ async def fetch_ransomware_live() -> list[dict]:
         name    = victim.get("post_title", "unknown")
         country = victim.get("country",    "N/A")
         sector  = victim.get("activity",   "N/A")
-        desc    = victim.get("description","")
-        date    = victim.get("published",  "")
+        desc    = victim.get("description", "")
+        date    = victim.get("published",   "")
 
         vid = hashlib.md5(f"{group}_{name}_{date}".encode()).hexdigest()
         items.append({
@@ -659,11 +682,11 @@ def fetch_rss(source: str, url: str) -> list[dict]:
     for entry in feed.entries[:5]:
         link = entry.get("link", entry.get("id", url))
         items.append({
-            "id":    hashlib.md5(link.encode()).hexdigest(),
-            "title": entry.get("title", "Sin título"),
-            "desc":  entry.get("summary", entry.get("description", ""))[:600],
+            "id":     hashlib.md5(link.encode()).hexdigest(),
+            "title":  clean_text(entry.get("title", "Sin título")),
+            "desc":   clean_text(entry.get("summary", entry.get("description", "")))[:600],
             "source": source,
-            "link":  link,
+            "link":   link,
         })
     return items
 
@@ -708,7 +731,7 @@ def get_priority(item: dict) -> int:
         return 3
     return 0   # low → no enviar
 
-PRIORITY_ICON = {1: "🔴", 2: "🟠", 3: "🟡"}
+PRIORITY_ICON  = {1: "🔴", 2: "🟠", 3: "🟡"}
 CATEGORY_LABEL = {
     "ransomware":    "RANSOMWARE",
     "phishing":      "PHISHING",
@@ -735,16 +758,16 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     title = escape_markdown(item["title"][:100])
     link  = item.get("link", "")
 
-    if NOTIFY_DETAIL == "minimal":
+    if detail == "minimal":
         msg = f"{icon} *{title}* — {item['source']}"
         if link:
             msg += f"\n🔗 {link}"
         return msg
 
-    if NOTIFY_DETAIL == "detailed":
+    if detail == "detailed":
         controls = get_cis_controls(item["category"])
         cis_line = "\n".join(f"  • `{c[0]}` {c[1]}" for c in controls)
-        sme = "✅ Relevante PyME" if item["sme_relevant"] else "➖ No prioritario"
+        sme        = "✅ Relevante PyME" if item["sme_relevant"] else "➖ No prioritario"
         summary    = escape_markdown(item.get("summary", "")[:200])
         sme_reason = escape_markdown(item["sme_reason"][:150])
         msg = (
@@ -820,60 +843,45 @@ def get_daily_summary(con) -> str | None:
 async def run():
     validate_config()
 
-    con     = init_db()
-    bot     = Bot(token=TELEGRAM_TOKEN)
-    sent    = 0
-    errors  = 0
-    now     = datetime.now(timezone.utc)
+    con    = init_db()
+    bot    = Bot(token=TELEGRAM_TOKEN)
+    sent   = 0
+    errors = 0
+    now    = datetime.now(timezone.utc)
 
     # ── Procesar comandos entrantes ───────────────────────────
     try:
         await handle_commands(bot, con)
     except Exception as e:
-        print(f"  [WARN] handle_commands: {e}")
+        logger.warning(f"handle_commands: {e}")
 
     # ── Fetch todas las fuentes ───────────────────────────────
     all_entries = []
 
-    #Debugging...
-    #await debug_ransomware_live()
-
     for source, url in FEEDS.items():
-        print(f"[FETCH] {source}")
+        logger.info(f"[FETCH] {source}")
         try:
             all_entries.extend(fetch_rss(source, url))
         except Exception as e:
-            print(f"  [WARN] {source}: {e}")
+            logger.warning(f"{source}: {e}")
 
-    print("[FETCH] CISA KEV")
-    try:
-        all_entries.extend(await fetch_cisa_kev())
-    except Exception as e:
-        print(f"  [WARN] CISA KEV: {e}")
-
-    print("[FETCH] Abuse.ch URLhaus")
-    try:
-        all_entries.extend(await fetch_urlhaus())
-    except Exception as e:
-        print(f"  [WARN] URLhaus: {e}")
-
-    print("[FETCH] Ransomware.live")
-    try:
-        all_entries.extend(await fetch_ransomware_live())
-    except Exception as e:
-        print(f"  [WARN] Ransomware.live: {e}")
-
-    print("[FETCH] EPSS/FIRST")
-    try:
-        all_entries.extend(await fetch_epss_high())
-    except Exception as e:
-        print(f"  [WARN] EPSS: {e}")
+    for label, coro in [
+        ("CISA KEV",       fetch_cisa_kev()),
+        ("Abuse.ch URLhaus", fetch_urlhaus()),
+        ("Ransomware.live",  fetch_ransomware_live()),
+        ("EPSS/FIRST",       fetch_epss_high()),
+    ]:
+        logger.info(f"[FETCH] {label}")
+        try:
+            all_entries.extend(await coro)
+        except Exception as e:
+            logger.warning(f"{label}: {e}")
 
     # ── Clasificación ─────────────────────────────────────────
     results = []
     for entry in all_entries:
         if is_seen(con, entry["id"]):
-            print(f"  [SKIP] {entry['title'][:60]}")
+            logger.debug(f"[SKIP] {entry['title'][:60]}")
             continue
         try:
             result = classify(entry["title"], entry["desc"], source=entry["source"])
@@ -882,26 +890,24 @@ async def run():
             result["source"] = entry["source"]
             result["link"]   = entry.get("link", "")
 
-            print(f"  [{result['severity'].upper()}] {entry['title'][:60]}")
+            logger.info(f"  [{result['severity'].upper()}] {entry['title'][:60]}")
             save_item(con, result)
             results.append(result)
 
         except json.JSONDecodeError as e:
-            print(f"  [ERROR] JSON inválido: {e}")
+            logger.error(f"JSON inválido clasificando '{entry['title'][:40]}': {e}")
             errors += 1
         except Exception as e:
-            print(f"  [ERROR] {entry['title'][:50]}: {e}")
+            logger.error(f"{entry['title'][:50]}: {e}")
             errors += 1
 
     # ── Envío por usuario ─────────────────────────────────────
-    is_summary_hour = (now.hour == DAILY_SUMMARY_HOUR and now.minute < 10)
-
-    # todos los usuarios registrados + owner del .env, restringido al allowlist
-    chat_ids = set([TELEGRAM_CHAT_ID])
-    rows = con.execute("SELECT chat_id FROM user_config").fetchall()
-    for row in rows:
+    chat_ids = {TELEGRAM_CHAT_ID}
+    for row in con.execute("SELECT chat_id FROM user_config").fetchall():
         chat_ids.add(row[0])
     chat_ids &= ALLOWED_CHAT_IDS
+
+    today_str = now.date().isoformat()
 
     for chat_id in chat_ids:
         cfg  = get_user_config(con, chat_id)
@@ -925,23 +931,29 @@ async def run():
                         break
                     except Exception as e:
                         if attempt < 2:
-                            print(f"  [RETRY {attempt+1}] {str(e)[:50]}")
+                            logger.warning(f"[RETRY {attempt+1}] {str(e)[:50]}")
                             await asyncio.sleep(2 ** attempt)
                         else:
-                            print(f"  [ERROR] send definitivo: {str(e)[:50]}")
+                            logger.error(f"send definitivo a {chat_id}: {str(e)[:50]}")
                             errors += 1
 
-        if mode in ("daily", "both") and is_summary_hour:
-            summary_msg = get_daily_summary(con)
-            if summary_msg:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=summary_msg,
-                    parse_mode="Markdown"
-                )
-                print(f"  [SUMMARY] Resumen diario enviado a {chat_id}")
+        if mode in ("daily", "both"):
+            last_sent = cfg.get("last_daily_summary") or ""
+            if last_sent != today_str and now.hour >= DAILY_SUMMARY_HOUR:
+                summary_msg = get_daily_summary(con)
+                if summary_msg:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=summary_msg,
+                            parse_mode="Markdown"
+                        )
+                        save_user_config(con, chat_id, last_daily_summary=today_str)
+                        logger.info(f"Resumen diario enviado a {chat_id}")
+                    except Exception as e:
+                        logger.error(f"Error enviando resumen diario a {chat_id}: {e}")
 
-    print(f"\n[DONE] {sent} alertas enviadas, {errors} errores.")
+    logger.info(f"[DONE] {sent} alertas enviadas, {errors} errores.")
     con.close()
 
 if __name__ == "__main__":
