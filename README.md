@@ -160,6 +160,11 @@ TELEGRAM_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=987654321
 GROQ_API_KEY=gsk_...
 
+# chat_ids adicionales autorizados a usar comandos del bot y recibir alertas
+# (separados por coma). El owner (TELEGRAM_CHAT_ID) siempre está autorizado;
+# cualquier otro chat_id que le escriba al bot es ignorado.
+ALLOWED_CHAT_IDS=
+
 # ── Filtros de envío ──────────────────────────────────────────
 # Prioridad máxima a enviar: 1=solo crítico, 2=crítico+importante, 3=todo
 SEND_PRIORITY_UP_TO=2

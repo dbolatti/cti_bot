@@ -4,11 +4,19 @@ import asyncio
 import hashlib
 import json
 import os
+import re
+import sys
 from datetime import datetime, timezone
 from groq import Groq
 from telegram import Bot
 from dotenv import load_dotenv
 import time
+
+# Ensure the console handles UTF-8 (Cyrillic, CJK, etc.) without crashing on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Configuración ─────────────────────────────────────────────
 load_dotenv()
@@ -16,6 +24,26 @@ load_dotenv()
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+
+# chat_ids autorizados a controlar el bot y recibir alertas.
+# Por defecto solo el owner (TELEGRAM_CHAT_ID); se puede sumar otros vía ALLOWED_CHAT_IDS.
+_allowed_extra    = [c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()]
+ALLOWED_CHAT_IDS  = set(filter(None, [TELEGRAM_CHAT_ID] + _allowed_extra))
+
+def validate_config():
+    """Verifica que las credenciales obligatorias estén presentes antes de correr el pipeline."""
+    missing = [
+        name for name, val in (
+            ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
+            ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+            ("GROQ_API_KEY", GROQ_API_KEY),
+        )
+        if not val
+    ]
+    if missing:
+        raise SystemExit(
+            f"[FATAL] Faltan variables de entorno obligatorias en .env: {', '.join(missing)}"
+        )
 
 # ── Configuración de notificaciones ──────────────────────────
 SEND_PRIORITY_UP_TO  = int(os.getenv("SEND_PRIORITY_UP_TO", "2"))
@@ -257,6 +285,11 @@ async def handle_commands(bot, con):
         if not text.startswith("/"):
             continue
 
+        # solo chat_ids autorizados pueden controlar el bot / quedar suscriptos a alertas
+        if chat_id not in ALLOWED_CHAT_IDS:
+            print(f"  [SECURITY] comando ignorado de chat_id no autorizado: {chat_id}")
+            continue
+
         parts = text.split()
         cmd   = parts[0]
         arg   = parts[1] if len(parts) > 1 else ""
@@ -387,17 +420,41 @@ Formato requerido:
   "summary": "resumen en máximo 2 líneas en español"
 }}"""
 
+REQUIRED_CLASSIFY_KEYS = {"category", "severity", "sme_relevant", "sme_reason", "summary"}
+VALID_CATEGORIES       = set(CIS_MAPPING.keys())
+VALID_SEVERITIES       = {"high", "medium", "low"}
+
+def validate_classification(result: dict) -> dict:
+    """Normaliza y valida el JSON devuelto por el LLM antes de confiar en él.
+
+    El contenido de los feeds no es confiable (prompt injection indirecto),
+    así que acá se acota el resultado a valores conocidos en vez de propagar
+    lo que el modelo haya decidido devolver.
+    """
+    if not REQUIRED_CLASSIFY_KEYS.issubset(result.keys()):
+        raise ValueError(f"Respuesta LLM incompleta, faltan claves: {result!r}")
+
+    if result["category"] not in VALID_CATEGORIES:
+        result["category"] = "other"
+    if result["severity"] not in VALID_SEVERITIES:
+        result["severity"] = "low"
+
+    result["sme_relevant"] = bool(result["sme_relevant"])
+    result["sme_reason"]   = str(result["sme_reason"])[:200]
+    result["summary"]      = str(result["summary"])[:400]
+    return result
+
 def classify(title: str, desc: str, source: str = "") -> dict:
     # bypass para fuentes con categoría conocida
     if source in SOURCE_DEFAULTS:
         result = SOURCE_DEFAULTS[source].copy()
         result["summary"] = title[:120]
-        return result
+        return validate_classification(result)
 
     # resto pasa por Groq
     resp = client_groq.chat.completions.create(
         #model="llama-3.3-70b-versatile",
-        model="llama3-8b-8192"
+        model="llama-3.1-8b-instant",
         messages=[
             {
                 "role": "user",
@@ -416,12 +473,15 @@ def classify(title: str, desc: str, source: str = "") -> dict:
         if raw.startswith("json"):
             raw = raw[4:]
     time.sleep(0.3)
-    return json.loads(raw.strip())
+    result = json.loads(raw.strip())
+    return validate_classification(result)
 
 
 # ── Fetch RSS ──────────────────────────────────────────────────
 
 import httpx
+
+CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 async def fetch_epss_high() -> list[dict]:
     """CVEs con EPSS score > 0.7, enriquecidos con descripción de NVD."""
@@ -445,28 +505,26 @@ async def fetch_epss_high() -> list[dict]:
             cvss     = "N/A"
             nvd_desc = ""
 
-            configs = vuln.get("configurations", [])
-            for config in configs:
-                for node in config.get("nodes", []):
-                    cpe_list = node.get("cpeMatch", [])
-                    if cpe_list:
-                        cpe   = cpe_list[0].get("criteria", "")
-                        parts = cpe.split(":")
-                        if len(parts) >= 5:
-                            vendor  = parts[3].replace("_", " ").title()
-                            product = parts[4].replace("_", " ").title()
-                        break
-                if vendor != "N/A":
-                    break
+            if not CVE_RE.match(cve):
+                print(f"  [WARN] CVE con formato inválido, se omite enriquecimiento: {cve!r}")
+                vid = hashlib.md5(cve.encode()).hexdigest()
+                items.append({
+                    "id":    vid,
+                    "title": f"{cve} — EPSS {score:.1%}",
+                    "desc":  f"CVE: {cve} | EPSS: {score:.4f} (percentil {pct:.0%})",
+                    "source": "EPSS/FIRST",
+                    "link":   "https://nvd.nist.gov/vuln/search",
+                })
+                continue
 
             try:
-                nvd_url  = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}"
-                
+                nvd_url  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
                 headers = {}
                 nvd_key = os.getenv("NVD_API_KEY")
                 if nvd_key:
                     headers["apiKey"] = nvd_key
-                nvd_resp = await client.get(nvd_url, headers=headers)
+                nvd_resp = await client.get(nvd_url, params={"cveId": cve}, headers=headers)
 
                 if nvd_resp.status_code == 200:
                     nvd_data = nvd_resp.json()
@@ -610,6 +668,22 @@ def fetch_rss(source: str, url: str) -> list[dict]:
     return items
 
 # ── Formato Telegram ───────────────────────────────────────────
+_MARKDOWN_SPECIAL_CHARS = ("_", "*", "[", "`")
+
+def escape_markdown(text: str) -> str:
+    """Escapa caracteres especiales de Markdown legacy de Telegram.
+
+    El título/resumen/descripción viene de feeds y APIs externas no confiables
+    (contenido de terceros), así que sin escapar se podría inyectar sintaxis
+    Markdown (ej. `[texto](url)`) y renderizar un link falso dentro de una
+    alerta que el analista asume legítima por venir de una fuente conocida.
+    """
+    if not text:
+        return text
+    for ch in _MARKDOWN_SPECIAL_CHARS:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 SEVERITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 CATEGORY_ICON = {
     "ransomware":    "💀",
@@ -658,7 +732,7 @@ def should_process(item: dict) -> bool:
 def format_message_for(item: dict, priority: int, detail: str = "compact") -> str:
     icon  = PRIORITY_ICON[priority]
     cat   = CATEGORY_LABEL.get(item["category"], "INFO")
-    title = item["title"][:100]
+    title = escape_markdown(item["title"][:100])
     link  = item.get("link", "")
 
     if NOTIFY_DETAIL == "minimal":
@@ -671,12 +745,14 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         controls = get_cis_controls(item["category"])
         cis_line = "\n".join(f"  • `{c[0]}` {c[1]}" for c in controls)
         sme = "✅ Relevante PyME" if item["sme_relevant"] else "➖ No prioritario"
+        summary    = escape_markdown(item.get("summary", "")[:200])
+        sme_reason = escape_markdown(item["sme_reason"][:150])
         msg = (
             f"{icon} P{priority} · {cat} · {item['source']}\n"
             f"*{title}*\n\n"
-            f"📋 {item.get('summary', '')[:200]}\n\n"
+            f"📋 {summary}\n\n"
             f"{sme}\n"
-            f"_{item['sme_reason'][:150]}_\n\n"
+            f"_{sme_reason}_\n\n"
             f"*Controles CIS IG1:*\n{cis_line}"
         )
         if link:
@@ -686,7 +762,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     # compact (default)
     controls = get_cis_controls(item["category"])
     cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])
-    sme      = item["sme_reason"][:120]
+    sme      = escape_markdown(item["sme_reason"][:120])
     msg = (
         f"{icon} P{priority} · {cat} · {item['source']}\n"
         f"*{title}*\n"
@@ -727,11 +803,13 @@ def get_daily_summary(con) -> str | None:
         controls = json.loads(cis_json) if cis_json else []
         cis_str  = " · ".join(f"`{c}`" for c in controls[:2])
         sme_mark = "✅" if sme_flag else "➖"
+        title    = escape_markdown(title[:80])
+        summary  = escape_markdown((summary or "")[:100])
 
         lines.append(
-            f"{i}. {sev_icon} *{title[:80]}*\n"
+            f"{i}. {sev_icon} *{title}*\n"
             f"   {cat} · {source} · {sme_mark}\n"
-            f"   _{summary[:100]}_\n"
+            f"   _{summary}_\n"
             f"   CIS: {cis_str}\n"
         )
 
@@ -740,6 +818,8 @@ def get_daily_summary(con) -> str | None:
 
 # ── Pipeline ───────────────────────────────────────────────────
 async def run():
+    validate_config()
+
     con     = init_db()
     bot     = Bot(token=TELEGRAM_TOKEN)
     sent    = 0
@@ -747,7 +827,10 @@ async def run():
     now     = datetime.now(timezone.utc)
 
     # ── Procesar comandos entrantes ───────────────────────────
-    await handle_commands(bot, con)
+    try:
+        await handle_commands(bot, con)
+    except Exception as e:
+        print(f"  [WARN] handle_commands: {e}")
 
     # ── Fetch todas las fuentes ───────────────────────────────
     all_entries = []
@@ -813,11 +896,12 @@ async def run():
     # ── Envío por usuario ─────────────────────────────────────
     is_summary_hour = (now.hour == DAILY_SUMMARY_HOUR and now.minute < 10)
 
-    # todos los usuarios registrados + owner del .env
+    # todos los usuarios registrados + owner del .env, restringido al allowlist
     chat_ids = set([TELEGRAM_CHAT_ID])
     rows = con.execute("SELECT chat_id FROM user_config").fetchall()
     for row in rows:
         chat_ids.add(row[0])
+    chat_ids &= ALLOWED_CHAT_IDS
 
     for chat_id in chat_ids:
         cfg  = get_user_config(con, chat_id)
