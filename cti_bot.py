@@ -480,7 +480,7 @@ def classify(title: str, desc: str, source: str = "") -> dict:
     for attempt in range(3):
         try:
             resp = client_groq.chat.completions.create(
-                model="llama3-8b-8192",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {
                         "role": "user",
