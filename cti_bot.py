@@ -474,12 +474,13 @@ def classify(title: str, desc: str, source: str = "") -> dict:
         result = SOURCE_DEFAULTS[source].copy()
         result["summary"] = title[:120]
         return validate_classification(result)
+    
+    time.sleep(1.5)   # ← agregá esto antes de la llamada a Groq
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = client_groq.chat.completions.create(
-                #model="llama-3.3-70b-versatile",
-                model="llama-3.1-8b-instant",
+                model="llama3-8b-8192",
                 messages=[
                     {
                         "role": "user",
@@ -501,8 +502,22 @@ def classify(title: str, desc: str, source: str = "") -> dict:
             result = json.loads(raw.strip())
             return validate_classification(result)
         except json.JSONDecodeError:
-            if attempt == 0:
-                logger.warning(f"JSON inválido en classify(), reintentando con temperature=0: {title[:40]!r}")
+            if attempt < 2:
+                logger.warning(f"JSON inválido en classify(), reintentando: {title[:40]!r}")
+                time.sleep(1)
+                continue
+            raise
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate_limit" in err_str.lower():
+                # extraer tiempo de espera del mensaje de error si está disponible
+                wait = 10 * (attempt + 1)
+                import re as _re
+                m = _re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
+                if m:
+                    wait = float(m.group(1)) + 1
+                logger.warning(f"Rate limit Groq, esperando {wait:.0f}s (intento {attempt+1}/3)")
+                time.sleep(wait)
                 continue
             raise
 
@@ -552,9 +567,9 @@ async def fetch_epss_high() -> list[dict]:
                 if nvd_key:
                     headers["apiKey"] = nvd_key
                 nvd_resp = await client.get(
-                    "https://services.nvd.nist.gov/rest/json/cves/2.0",
-                    params={"cveId": cve},
+                    f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}",
                     headers=headers,
+                    follow_redirects=True,
                 )
 
                 if nvd_resp.status_code == 200:
@@ -566,17 +581,19 @@ async def fetch_epss_high() -> list[dict]:
                             nvd_desc = d.get("value", "")[:300]
                             break
 
-                    cpe_list = (
-                        vuln.get("configurations", [{}])[0]
-                            .get("nodes", [{}])[0]
-                            .get("cpeMatch", [])
-                    )
-                    if cpe_list:
-                        cpe   = cpe_list[0].get("criteria", "")
-                        parts = cpe.split(":")
-                        if len(parts) >= 5:
-                            vendor  = parts[3].replace("_", " ").title()
-                            product = parts[4].replace("_", " ").title()
+                    # recorrer configuraciones anidadas para encontrar el primer CPE
+                    for config in vuln.get("configurations", []):
+                        for node in config.get("nodes", []):
+                            cpe_list = node.get("cpeMatch", [])
+                            if cpe_list:
+                                cpe   = cpe_list[0].get("criteria", "")
+                                parts = cpe.split(":")
+                                if len(parts) >= 5:
+                                    vendor  = parts[3].replace("_", " ").title()
+                                    product = parts[4].replace("_", " ").title()
+                                break
+                        if vendor != "N/A":
+                            break
 
                     metrics = vuln.get("metrics", {})
                     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
@@ -631,9 +648,16 @@ async def fetch_cisa_kev() -> list[dict]:
     return items
 
 async def fetch_urlhaus() -> list[dict]:
-    url = "https://urlhaus-api.abuse.ch/v1/urls/recent/"
+    url     = "https://urlhaus-api.abuse.ch/v1/urls/recent/"
+    api_key = os.getenv("URLHAUS_API_KEY", "")
+    headers = {"Auth-Key": api_key} if api_key else {}
+
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, data={"limit": 20})
+        resp = await client.post(url, data={"limit": 20}, headers=headers)
+        if resp.status_code == 401:
+            logger.warning("URLhaus: API key requerida — registrarse en abuse.ch y agregar URLHAUS_API_KEY al .env")
+            return []
+        resp.raise_for_status()
         data = resp.json()
 
     items = []
@@ -652,7 +676,7 @@ async def fetch_urlhaus() -> list[dict]:
 
 async def fetch_ransomware_live() -> list[dict]:
     url = "https://api.ransomware.live/v1/recentvictims"
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
