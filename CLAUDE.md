@@ -68,9 +68,10 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
 
 2. **Fetch de fuentes** — cada fuente es independiente y envuelta en try/except propio en `run()`,
    así que si una falla no tumba el resto del pipeline:
-   - `fetch_rss(source, url)` — feeds RSS del dict `FEEDS` (13 fuentes), vía `feedparser`
+   - `fetch_rss(source, url)` — feeds RSS del dict `FEEDS` (14 fuentes, incluye INCIBE-CERT), vía `feedparser`
    - `fetch_cisa_kev()` — JSON de CISA KEV
-   - `fetch_urlhaus()` — API de Abuse.ch URLhaus (solo URLs `online`)
+   - `fetch_urlhaus()` — API de Abuse.ch URLhaus (solo URLs `online`, requiere `URLHAUS_API_KEY` desde jun/2025 — endpoint es GET, no POST)
+   - `fetch_threatfox()` — API de Abuse.ch ThreatFox, IOCs de malware/C2 con `confidence_level >= 75`, top 12; reutiliza `URLHAUS_API_KEY` (misma cuenta abuse.ch)
    - `fetch_ransomware_live()` — API de Ransomware.live
    - `fetch_epss_high()` — CVEs con EPSS score > 0.7 desde FIRST, enriquecidos con vendor/producto/CVSS
      consultando NVD por cada CVE (rate-limited con `asyncio.sleep`)
@@ -104,12 +105,24 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    actual coincide con `DAILY_SUMMARY_HOUR` (ventana de los primeros 10 minutos de esa hora, porque
    el scheduler corre cada 2hs y no hay garantía de caer justo en el minuto 0).
 
+6. **Alertas de configuración** — durante el fetch/clasificación, `flag_config_issue(key, msg)`
+   detecta fallas por API key inválida/faltante (URLhaus 401/403, ThreatFox 401/403/`unknown_auth_key`,
+   NVD 404 con header `message: Invalid apiKey`, Groq 401/`invalid_api_key`) y las junta en
+   `CONFIG_ISSUES` (deduplicadas por `key` dentro de la corrida vía `_flagged_this_run`). Al final
+   del fetch+clasificación, si hay issues nuevos (no avisados hoy, `should_alert_config_issue()`),
+   se manda **un solo mensaje consolidado al dueño del bot** (`TELEGRAM_CHAT_ID`, no a todos los
+   chat_ids) y se marca en `config_alerts` para no repetir el mismo aviso el mismo día
+   (`mark_config_issue_alerted()`). Es intencional que solo cubra problemas de configuración
+   (credenciales), no errores transitorios de red — esos ya se loguean pero no generan alerta.
+
 ### Esquema SQLite (`cti.db`, se crea solo si no existe)
 
 - `items` — historial de todo lo clasificado, PK = hash del link/id de origen → es lo que
   implementa la deduplicación entre corridas (`is_seen()`).
 - `user_config` — override de preferencias por `chat_id`, default cuando no hay fila = valores
   globales del `.env` (ver `get_user_config()`).
+- `config_alerts` — throttle diario (`issue_key` → `last_sent`) para no repetir el mismo aviso de
+  configuración más de una vez por día (ver punto 6 de arriba).
 
 ### Puntos a tener en cuenta al modificar
 
@@ -122,3 +135,6 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
   último procesado entre corridas más allá del `offset` que se envía al final — si el proceso corre
   cada 2hs vía scheduler, comandos enviados y no vistos en la ventana de fetch se pierden hasta la
   próxima corrida.
+- Al agregar una fuente nueva que requiera API key, agregar también la detección de key
+  inválida/faltante con `flag_config_issue()` (ver patrón en `fetch_urlhaus`/`fetch_threatfox`) para
+  que el dueño se entere por Telegram en vez de tener la fuente muerta en silencio en los logs.

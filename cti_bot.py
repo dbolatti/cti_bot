@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from groq import Groq
-from telegram import Bot
+from telegram import Bot, LinkPreviewOptions
 from dotenv import load_dotenv
 
 # ── Consola UTF-8 (Windows) ────────────────────────────────────
@@ -31,6 +31,19 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+# ── Alertas de configuración (API keys inválidas/faltantes, etc.) ─────
+# Se acumulan durante una corrida y se avisan al dueño del bot por Telegram
+# (con throttle diario, ver should_alert_config_issue/mark_config_issue_alerted).
+CONFIG_ISSUES: list[tuple[str, str]] = []
+_flagged_this_run: set[str] = set()
+
+def flag_config_issue(key: str, message: str):
+    if key in _flagged_this_run:
+        return
+    _flagged_this_run.add(key)
+    CONFIG_ISSUES.append((key, message))
+    logger.warning(f"[CONFIG] {message}")
 
 # ── Configuración ─────────────────────────────────────────────
 load_dotenv()
@@ -82,7 +95,10 @@ FEEDS = {
     "ThreatPost":         "https://threatpost.com/feed/",
     "Dark Reading":       "https://www.darkreading.com/rss.xml",
     "CERT/CC":            "https://www.kb.cert.org/feeds/cert-kb-latest.xml",
+    "INCIBE-CERT":        "https://www.incibe.es/en/incibe-cert/alerta-temprana/avisos/feed",
 }
+
+LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
 
 DB_PATH = "cti.db"
 
@@ -145,6 +161,13 @@ SOURCE_DEFAULTS = {
         "sme_reason":   "URL maliciosa activa — riesgo de infección por navegación o email",
         "summary":      "",
     },
+    "Abuse.ch ThreatFox": {
+        "category":     "malware",
+        "severity":     "high",
+        "sme_relevant":  True,
+        "sme_reason":   "CIS-8.1: IOC de malware/C2 de alta confianza — bloquear en firewall/EDR",
+        "summary":      "",
+    },
     "EPSS/FIRST": {
         "category":     "vulnerability",
         "severity":     "high",
@@ -197,6 +220,12 @@ def init_db():
             last_daily_summary TEXT DEFAULT ''
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS config_alerts (
+            issue_key TEXT PRIMARY KEY,
+            last_sent TEXT
+        )
+    """)
     # migration: add column to DBs created before this column existed
     try:
         con.execute("ALTER TABLE user_config ADD COLUMN last_daily_summary TEXT DEFAULT ''")
@@ -204,6 +233,22 @@ def init_db():
         pass
     con.commit()
     return con
+
+def should_alert_config_issue(con, issue_key: str) -> bool:
+    """True si este problema de config todavía no se avisó hoy (throttle diario)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = con.execute(
+        "SELECT last_sent FROM config_alerts WHERE issue_key=?", (issue_key,)
+    ).fetchone()
+    return not row or row[0] != today
+
+def mark_config_issue_alerted(con, issue_key: str):
+    today = datetime.now(timezone.utc).date().isoformat()
+    con.execute(
+        "INSERT OR REPLACE INTO config_alerts (issue_key, last_sent) VALUES (?,?)",
+        (issue_key, today)
+    )
+    con.commit()
 
 _USER_CONFIG_COLS = [
     "chat_id", "notify_mode", "notify_detail", "priority_max",
@@ -519,6 +564,12 @@ def classify(title: str, desc: str, source: str = "") -> dict:
                 logger.warning(f"Rate limit Groq, esperando {wait:.0f}s (intento {attempt+1}/3)")
                 time.sleep(wait)
                 continue
+            if "401" in err_str or "invalid_api_key" in err_str.lower():
+                flag_config_issue(
+                    "groq_auth",
+                    "Groq: la API key configurada es inválida (401). Generá una nueva en "
+                    "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
+                )
             raise
 
 # ── Fetch de fuentes ───────────────────────────────────────────
@@ -600,6 +651,13 @@ async def fetch_epss_high() -> list[dict]:
                         if key in metrics:
                             cvss = metrics[key][0]["cvssData"].get("baseScore", "N/A")
                             break
+                elif nvd_resp.status_code == 404 and nvd_resp.headers.get("message", "").lower().startswith("invalid apikey"):
+                    flag_config_issue(
+                        "nvd_auth",
+                        "NVD: la API key configurada es inválida (\"Invalid apiKey\"). Generá una "
+                        "nueva en https://nvd.nist.gov/developers/request-an-api-key o dejá "
+                        "NVD_API_KEY vacío en .env para usar el modo sin key (más lento pero funcional)."
+                    )
                 else:
                     logger.warning(f"NVD respondió {nvd_resp.status_code} para {cve}")
 
@@ -648,14 +706,21 @@ async def fetch_cisa_kev() -> list[dict]:
     return items
 
 async def fetch_urlhaus() -> list[dict]:
+    # Desde junio 2025 la API exige GET (POST devuelve 405 "http_get_expected")
+    # y Auth-Key obligatorio — ver https://urlhaus.abuse.ch/api/
     url     = "https://urlhaus-api.abuse.ch/v1/urls/recent/"
     api_key = os.getenv("URLHAUS_API_KEY", "")
     headers = {"Auth-Key": api_key} if api_key else {}
 
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, data={"limit": 20}, headers=headers)
-        if resp.status_code == 401:
-            logger.warning("URLhaus: API key requerida — registrarse en abuse.ch y agregar URLHAUS_API_KEY al .env")
+        resp = await client.get(url, params={"limit": 20}, headers=headers)
+        # 401 = sin Auth-Key, 403 = Auth-Key presente pero inválida (query_status "unknown_auth_key")
+        if resp.status_code in (401, 403):
+            flag_config_issue(
+                "urlhaus_auth",
+                "URLhaus: falta o es inválida la Auth-Key. Generá una gratis en "
+                "https://auth.abuse.ch/ y cargala en URLHAUS_API_KEY en .env"
+            )
             return []
         resp.raise_for_status()
         data = resp.json()
@@ -671,6 +736,58 @@ async def fetch_urlhaus() -> list[dict]:
             "desc":   f"URL: {entry['url']} | Tags: {', '.join(entry.get('tags') or ['sin tags'])}",
             "source": "Abuse.ch URLhaus",
             "link":   entry.get("urlhaus_reference", ""),
+        })
+    return items
+
+async def fetch_threatfox(min_confidence: int = 75, max_items: int = 12) -> list[dict]:
+    """IOCs de malware/C2 de alta confianza reportados en las últimas 24hs (abuse.ch ThreatFox).
+
+    Reutiliza el mismo Auth-Key de cuenta abuse.ch que URLhaus (autenticación
+    unificada desde la migración "Community First" de 2025).
+    """
+    url     = "https://threatfox-api.abuse.ch/api/v1/"
+    api_key = os.getenv("URLHAUS_API_KEY", "")
+    headers = {"Auth-Key": api_key} if api_key else {}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, json={"query": "get_iocs", "days": 1}, headers=headers)
+        if resp.status_code in (401, 403):
+            flag_config_issue(
+                "threatfox_auth",
+                "ThreatFox: falta o es inválida la Auth-Key. Es la misma cuenta abuse.ch que "
+                "URLhaus — revisá URLHAUS_API_KEY en .env"
+            )
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+
+    if data.get("query_status") == "unknown_auth_key":
+        flag_config_issue(
+            "threatfox_auth",
+            "ThreatFox: falta o es inválida la Auth-Key. Es la misma cuenta abuse.ch que "
+            "URLhaus — revisá URLHAUS_API_KEY en .env"
+        )
+        return []
+    if data.get("query_status") != "ok":
+        return []
+
+    entries = [e for e in data.get("data", []) if e.get("confidence_level", 0) >= min_confidence]
+    entries.sort(key=lambda e: e.get("confidence_level", 0), reverse=True)
+
+    items = []
+    for entry in entries[:max_items]:
+        fid     = str(entry["id"])
+        malware = entry.get("malware_printable") or "unknown"
+        ioc_type = entry.get("ioc_type", "N/A")
+        items.append({
+            "id":     hashlib.md5(fid.encode()).hexdigest(),
+            "title":  f"IOC activo ({ioc_type}) — {malware}",
+            "desc":   (
+                f"IOC: {entry.get('ioc', '')} | Tipo: {entry.get('ioc_type_desc', '')} | "
+                f"Malware: {malware} | Confianza: {entry.get('confidence_level', 0)}%"
+            ),
+            "source": "Abuse.ch ThreatFox",
+            "link":   f"https://threatfox.abuse.ch/ioc/{fid}/",
         })
     return items
 
@@ -777,13 +894,14 @@ def should_process(item: dict) -> bool:
     return True
 
 def format_message_for(item: dict, priority: int, detail: str = "compact") -> str:
-    icon  = PRIORITY_ICON[priority]
-    cat   = CATEGORY_LABEL.get(item["category"], "INFO")
-    title = escape_markdown(item["title"][:100])
-    link  = item.get("link", "")
+    icon     = PRIORITY_ICON[priority]
+    cat      = CATEGORY_LABEL.get(item["category"], "INFO")
+    cat_icon = CATEGORY_ICON.get(item["category"], "📌")
+    title    = escape_markdown(item["title"][:100])
+    link     = item.get("link", "")
 
     if detail == "minimal":
-        msg = f"{icon} *{title}* — {item['source']}"
+        msg = f"{icon}{cat_icon} *{title}* — {item['source']}"
         if link:
             msg += f"\n🔗 {link}"
         return msg
@@ -795,7 +913,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         summary    = escape_markdown(item.get("summary", "")[:200])
         sme_reason = escape_markdown(item["sme_reason"][:150])
         msg = (
-            f"{icon} P{priority} · {cat} · {item['source']}\n"
+            f"{icon}{cat_icon} P{priority} · {cat} · {item['source']}\n"
             f"*{title}*\n\n"
             f"📋 {summary}\n\n"
             f"{sme}\n"
@@ -811,7 +929,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])
     sme      = escape_markdown(item["sme_reason"][:120])
     msg = (
-        f"{icon} P{priority} · {cat} · {item['source']}\n"
+        f"{icon}{cat_icon} P{priority} · {cat} · {item['source']}\n"
         f"*{title}*\n"
         f"_{sme}_\n"
         f"CIS: {cis_line}"
@@ -847,6 +965,7 @@ def get_daily_summary(con) -> str | None:
 
         sev_icon = SEVERITY_ICON.get(severity, "⚪")
         cat      = CATEGORY_LABEL.get(category, "INFO")
+        cat_icon = CATEGORY_ICON.get(category, "📌")
         controls = json.loads(cis_json) if cis_json else []
         cis_str  = " · ".join(f"`{c}`" for c in controls[:2])
         sme_mark = "✅" if sme_flag else "➖"
@@ -854,7 +973,7 @@ def get_daily_summary(con) -> str | None:
         summary  = escape_markdown((summary or "")[:100])
 
         lines.append(
-            f"{i}. {sev_icon} *{title}*\n"
+            f"{i}. {sev_icon}{cat_icon} *{title}*\n"
             f"   {cat} · {source} · {sme_mark}\n"
             f"   _{summary}_\n"
             f"   CIS: {cis_str}\n"
@@ -873,6 +992,9 @@ async def run():
     errors = 0
     now    = datetime.now(timezone.utc)
 
+    CONFIG_ISSUES.clear()
+    _flagged_this_run.clear()
+
     # ── Procesar comandos entrantes ───────────────────────────
     try:
         await handle_commands(bot, con)
@@ -890,8 +1012,9 @@ async def run():
             logger.warning(f"{source}: {e}")
 
     for label, coro in [
-        ("CISA KEV",       fetch_cisa_kev()),
+        ("CISA KEV",         fetch_cisa_kev()),
         ("Abuse.ch URLhaus", fetch_urlhaus()),
+        ("Abuse.ch ThreatFox", fetch_threatfox()),
         ("Ransomware.live",  fetch_ransomware_live()),
         ("EPSS/FIRST",       fetch_epss_high()),
     ]:
@@ -925,6 +1048,26 @@ async def run():
             logger.error(f"{entry['title'][:50]}: {e}")
             errors += 1
 
+    # ── Aviso de problemas de configuración (solo al dueño, 1x/día) ──
+    to_alert = [(k, m) for k, m in CONFIG_ISSUES if should_alert_config_issue(con, k)]
+    if to_alert:
+        lines = ["⚠️ *Problemas de configuración detectados*\n"]
+        for _, message in to_alert:
+            lines.append(f"🔑 {message}\n")
+        lines.append("_Este aviso se repite una vez por día mientras el problema persista._")
+        try:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="\n".join(lines),
+                parse_mode="Markdown",
+                link_preview_options=LINK_PREVIEW_OFF,
+            )
+            for key, _ in to_alert:
+                mark_config_issue_alerted(con, key)
+            logger.info(f"Alerta de configuración enviada: {[k for k, _ in to_alert]}")
+        except Exception as e:
+            logger.error(f"Error enviando alerta de configuración: {e}")
+
     # ── Envío por usuario ─────────────────────────────────────
     chat_ids = {TELEGRAM_CHAT_ID}
     for row in con.execute("SELECT chat_id FROM user_config").fetchall():
@@ -948,7 +1091,8 @@ async def run():
                         await bot.send_message(
                             chat_id=chat_id,
                             text=msg,
-                            parse_mode="Markdown"
+                            parse_mode="Markdown",
+                            link_preview_options=LINK_PREVIEW_OFF,
                         )
                         sent += 1
                         await asyncio.sleep(0.5)
@@ -970,7 +1114,8 @@ async def run():
                         await bot.send_message(
                             chat_id=chat_id,
                             text=summary_msg,
-                            parse_mode="Markdown"
+                            parse_mode="Markdown",
+                            link_preview_options=LINK_PREVIEW_OFF,
                         )
                         save_user_config(con, chat_id, last_daily_summary=today_str)
                         logger.info(f"Resumen diario enviado a {chat_id}")
