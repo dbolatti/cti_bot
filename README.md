@@ -112,11 +112,11 @@ fallas de configuración/credenciales — errores transitorios de red no generan
 
 ## Correlación entre fuentes
 
-Cada corrida cruza los CVEs y los IOCs (IPs, dominios, hashes) que trajeron las fuentes
-estructuradas de alta señal (CISA KEV, EPSS/FIRST, URLhaus, ThreatFox) contra el texto de las
-demás noticias. Si una noticia RSS menciona un CVE o un indicador que ya está confirmado como
-activo en otra fuente, se marca la alerta y se sube su prioridad — es una confirmación real, no
-solo una noticia más:
+Cada corrida cruza los CVEs, los IOCs (IPs, dominios, hashes) y los grupos de ransomware que
+trajeron las fuentes estructuradas de alta señal (CISA KEV, EPSS/FIRST, URLhaus, ThreatFox,
+Ransomware.live) contra el texto de las demás noticias. Si una noticia RSS menciona un CVE, un
+indicador o un grupo que ya está confirmado como activo en otra fuente, se marca la alerta y se
+sube su prioridad — es una confirmación real, no solo una noticia más:
 
 ```
 🔴🔓 P1 · VULN · BleepingComputer
@@ -126,6 +126,11 @@ CIS: CIS-7.1 · CIS-7.2
 🎯 Correlaciona con: CVE-2026-18577 (CISA KEV)
 🔗 https://...
 ```
+
+Los nombres de grupo de ransomware llevan un filtro extra que el resto no necesita: se descartan
+los de menos de 4 caracteres, porque a diferencia de un CVE o un hash, un nombre de grupo puede
+coincidir con una palabra común del idioma (ej. "Aurora" es a la vez un grupo real y un nombre
+propio) — el riesgo de falso positivo es mayor que con el resto de las correlaciones.
 
 Solo mira lo que trajo la corrida actual (no hay historial ni cambios de esquema en `cti.db`).
 
@@ -404,7 +409,7 @@ cti_bot/
 - [x] Configuración por chat vía comandos de Telegram
 - [x] Fuentes ThreatFox e INCIBE-CERT
 - [x] Alertas de configuración (API keys inválidas/faltantes) al dueño del bot
-- [x] Correlación de CVEs e IOCs entre fuentes
+- [x] Correlación de CVEs, IOCs y grupos de ransomware entre fuentes
 - [x] Remediación priorizada (Groq) para items P1/correlacionados
 - [x] Panorama diario generado por IA en el resumen
 - [ ] Ingesta desde canales Telegram vía Telethon

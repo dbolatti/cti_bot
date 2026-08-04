@@ -90,21 +90,34 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
      CIS ya resueltos como JSON, vía `get_cis_controls()` / `CIS_MAPPING`).
 
 4. **Correlación de indicadores (`build_correlation_index()`)** — antes de clasificar, se indexan
-   los CVEs y los IOCs (IPs/dominios/hashes) mencionados por las fuentes estructuradas de alta
-   señal de **esta misma corrida**: `CVE_CORRELATION_SOURCES = ("CISA KEV", "EPSS/FIRST")` para
-   CVEs (`find_cve_correlations()`, regex `CVE_MENTION_RE` no anclado) e
-   `IOC_CORRELATION_SOURCES = ("Abuse.ch URLhaus", "Abuse.ch ThreatFox")` para IOCs
-   (`find_ioc_correlations()`, extracción con `extract_iocs()` vía `IPV4_RE`/`DOMAIN_RE`/`HASH_RE`).
+   los CVEs, IOCs (IPs/dominios/hashes) y grupos de ransomware mencionados por las fuentes
+   estructuradas de alta señal de **esta misma corrida**:
+   - `CVE_CORRELATION_SOURCES = ("CISA KEV", "EPSS/FIRST")` para CVEs (`find_cve_correlations()`,
+     regex `CVE_MENTION_RE` no anclado)
+   - `IOC_CORRELATION_SOURCES = ("Abuse.ch URLhaus", "Abuse.ch ThreatFox")` para IOCs
+     (`find_ioc_correlations()`, extracción con `extract_iocs()` vía `IPV4_RE`/`DOMAIN_RE`/`HASH_RE`)
+   - `RANSOMWARE_CORRELATION_SOURCES = ("Ransomware.live",)` para nombres de grupo
+     (`find_ransomware_group_correlations()`, extraídos del campo `Grupo: X |` del `desc` vía
+     `RANSOMWARE_GROUP_RE`)
+
    Por cada item que no venga de `SOURCE_DEFAULTS`, se busca en su título+desc alguna mención a
-   esos indicadores. La precisión de la extracción de texto libre importa poco para el ruido: el
-   filtro real es el match exacto contra el puñado de indicadores confirmados de la corrida (no
-   contra listas externas ni heurísticas de confianza). Si hay match, se fuerza `sme_relevant=True`
-   (la correlación es una confirmación real, no solo una noticia más — sube la prioridad vía
-   `get_priority()`) y se guarda en `result["correlated"]` para mostrarlo en el mensaje
-   (`🎯 Correlaciona con: ...`, en `format_message_for()`, con los IOCs largos truncados a 20
-   caracteres). Solo mira la corrida actual, no hay historial en `cti.db` ni columna nueva — si se
-   quiere correlacionar contra corridas anteriores hay que sumar una columna a `items` y
-   consultarla acá.
+   esos indicadores. Para CVEs/IOCs el algoritmo es "extraer candidatos del texto y buscarlos en
+   el índice"; para grupos de ransomware es al revés — "buscar cada nombre conocido como palabra
+   completa en el texto" (`\bgrupo\b`), porque un nombre de grupo no tiene un formato regex
+   reconocible como un CVE o un hash. Por esto los grupos llevan un filtro extra que las otras
+   correlaciones no necesitan: se descartan nombres de menos de `MIN_RANSOMWARE_GROUP_LEN` (4)
+   caracteres, porque un nombre de grupo puede coincidir con una palabra común del idioma (ej.
+   "aurora" es, a la vez, un grupo real de ransomware y un nombre común) — más propenso a falsos
+   positivos que un CVE o un hash exacto. Para el resto, la precisión de la extracción de texto
+   libre importa poco para el ruido: el filtro real es el match exacto contra el puñado de
+   indicadores confirmados de la corrida (no contra listas externas ni heurísticas de confianza).
+
+   Si hay match, se fuerza `sme_relevant=True` (la correlación es una confirmación real, no solo
+   una noticia más — sube la prioridad vía `get_priority()`) y se guarda en `result["correlated"]`
+   para mostrarlo en el mensaje (`🎯 Correlaciona con: ...`, en `format_message_for()`, con los
+   IOCs largos truncados a 20 caracteres). Solo mira la corrida actual, no hay historial en
+   `cti.db` ni columna nueva — si se quiere correlacionar contra corridas anteriores hay que sumar
+   una columna a `items` y consultarla acá.
 
 5. **Sistema de prioridad (`get_priority()`)** — deriva P1/P2/P3 combinando `severity` + `sme_relevant`
    (no se persiste como columna, se recalcula al vuelo tanto para filtrar como para el ícono del mensaje):

@@ -984,6 +984,14 @@ def fetch_rss(source: str, url: str) -> list[dict]:
 CVE_MENTION_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 CVE_CORRELATION_SOURCES = ("CISA KEV", "EPSS/FIRST")
 IOC_CORRELATION_SOURCES = ("Abuse.ch URLhaus", "Abuse.ch ThreatFox")
+RANSOMWARE_GROUP_RE = re.compile(r"Grupo:\s*([^|]+?)\s*\|")
+RANSOMWARE_CORRELATION_SOURCES = ("Ransomware.live",)
+# Nombres de grupo cortos (< 4 caracteres) se descartan del índice: a diferencia de un
+# CVE o un hash, un nombre de grupo puede coincidir con una palabra común del idioma
+# (ej. "payload") y el match por substring en texto libre es más propenso a falsos
+# positivos que el resto de las correlaciones — este es el único filtro de ruido extra
+# que se le suma a esta correlación en particular.
+MIN_RANSOMWARE_GROUP_LEN = 4
 
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 HASH_RE = re.compile(r"\b[a-fA-F0-9]{64}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{32}\b")
@@ -1003,6 +1011,7 @@ def extract_iocs(text: str) -> set[str]:
 def build_correlation_index(all_entries: list[dict]) -> dict:
     cve_sources: dict[str, set] = {}
     ioc_sources: dict[str, set] = {}
+    ransomware_groups: dict[str, set] = {}
     for entry in all_entries:
         text = f"{entry['title']} {entry['desc']}"
         if entry["source"] in CVE_CORRELATION_SOURCES:
@@ -1011,7 +1020,12 @@ def build_correlation_index(all_entries: list[dict]) -> dict:
         if entry["source"] in IOC_CORRELATION_SOURCES:
             for ioc in extract_iocs(text):
                 ioc_sources.setdefault(ioc, set()).add(entry["source"])
-    return {"cve_sources": cve_sources, "ioc_sources": ioc_sources}
+        if entry["source"] in RANSOMWARE_CORRELATION_SOURCES:
+            for group in RANSOMWARE_GROUP_RE.findall(entry["desc"]):
+                group = group.strip().lower()
+                if len(group) >= MIN_RANSOMWARE_GROUP_LEN:
+                    ransomware_groups.setdefault(group, set()).add(entry["source"])
+    return {"cve_sources": cve_sources, "ioc_sources": ioc_sources, "ransomware_groups": ransomware_groups}
 
 def find_cve_correlations(text: str, index: dict) -> list[tuple[str, str]]:
     """Devuelve [(CVE, 'fuente1, fuente2'), ...] para los CVEs del texto que también
@@ -1036,6 +1050,16 @@ def find_ioc_correlations(text: str, index: dict) -> list[tuple[str, str]]:
         sources = index["ioc_sources"].get(ioc)
         if sources:
             found.append((ioc, ", ".join(sorted(sources))))
+    return found
+
+def find_ransomware_group_correlations(text: str, index: dict) -> list[tuple[str, str]]:
+    """Devuelve [(Grupo, 'fuente1, fuente2'), ...] para los grupos de ransomware de
+    Ransomware.live de esta corrida mencionados como palabra completa en el texto."""
+    found = []
+    text_lower = text.lower()
+    for group, sources in index["ransomware_groups"].items():
+        if re.search(rf"\b{re.escape(group)}\b", text_lower):
+            found.append((group.title(), ", ".join(sorted(sources))))
     return found
 
 # ── Formato Telegram ───────────────────────────────────────────
@@ -1278,6 +1302,7 @@ async def run():
                 matches = (
                     find_cve_correlations(entry_text, correlation_index)
                     + find_ioc_correlations(entry_text, correlation_index)
+                    + find_ransomware_group_correlations(entry_text, correlation_index)
                 )
                 if matches:
                     result["sme_relevant"] = True

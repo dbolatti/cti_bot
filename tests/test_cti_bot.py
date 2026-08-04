@@ -332,3 +332,55 @@ class TestFindIocCorrelations:
         index = {"cve_sources": {}, "ioc_sources": {"evil-domain.com": {"Abuse.ch ThreatFox"}}}
         matches = cti_bot.find_ioc_correlations("Dominio EVIL-DOMAIN.COM usado como C2", index)
         assert matches == [("evil-domain.com", "Abuse.ch ThreatFox")]
+
+
+# ── find_ransomware_group_correlations ──────────────────────────
+
+class TestFindRansomwareGroupCorrelations:
+    def _entry(self, source: str, title: str, desc: str = "") -> dict:
+        return {"id": "x", "title": title, "desc": desc, "source": source, "link": ""}
+
+    def test_index_picks_up_group_from_ransomware_live(self):
+        entries = [self._entry(
+            "Ransomware.live",
+            "Víctima ransomware: Acme Corp — dragonforce",
+            "Grupo: dragonforce | Sector: Manufacturing | País: US | Datos exfiltrados",
+        )]
+        index = cti_bot.build_correlation_index(entries)
+        assert "dragonforce" in index["ransomware_groups"]
+
+    def test_index_ignores_groups_from_regular_rss(self):
+        entries = [self._entry("BleepingComputer", "Ataque atribuido a dragonforce")]
+        index = cti_bot.build_correlation_index(entries)
+        assert index["ransomware_groups"] == {}
+
+    def test_index_discards_short_group_names(self):
+        entries = [self._entry(
+            "Ransomware.live",
+            "Víctima ransomware: Acme Corp — abc",
+            "Grupo: abc | Sector: N/A | País: N/A | ",
+        )]
+        index = cti_bot.build_correlation_index(entries)
+        assert index["ransomware_groups"] == {}
+
+    def test_find_correlation_match_and_title_cased(self):
+        index = {"ransomware_groups": {"dragonforce": {"Ransomware.live"}}}
+        matches = cti_bot.find_ransomware_group_correlations(
+            "La banda dragonforce reivindica el ataque", index
+        )
+        assert matches == [("Dragonforce", "Ransomware.live")]
+
+    def test_find_correlation_case_insensitive(self):
+        index = {"ransomware_groups": {"dragonforce": {"Ransomware.live"}}}
+        matches = cti_bot.find_ransomware_group_correlations("Grupo DRAGONFORCE activo", index)
+        assert matches == [("Dragonforce", "Ransomware.live")]
+
+    def test_find_correlation_no_match(self):
+        index = {"ransomware_groups": {"dragonforce": {"Ransomware.live"}}}
+        matches = cti_bot.find_ransomware_group_correlations("Noticia sin grupos conocidos", index)
+        assert matches == []
+
+    def test_find_correlation_respects_word_boundary(self):
+        index = {"ransomware_groups": {"qilin": {"Ransomware.live"}}}
+        matches = cti_bot.find_ransomware_group_correlations("mención de tranqilinidad en el texto", index)
+        assert matches == []
