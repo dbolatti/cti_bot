@@ -131,6 +131,32 @@ Solo mira lo que trajo la corrida actual (no hay historial ni cambios de esquema
 
 ---
 
+## Remediación priorizada y panorama diario (IA)
+
+Además de clasificar, el bot usa Groq para dos cosas más, acotadas para no disparar el costo en
+tokens con el volumen de la corrida:
+
+- **Qué hacer ahora**: para los items más críticos (P1, o cualquiera que haya correlacionado con
+  un CVE/IOC confirmado), un segundo prompt le pide a Groq 2-3 acciones concretas y en qué fijarse
+  en el propio entorno para confirmar exposición — no solo el tag de control CIS:
+
+  ```
+  🛠️ Qué hacer:
+  1. Revisar logs de firewall de los últimos 7 días por conexiones salientes al
+     dominio evil-domain.com.
+  2. Escanear endpoints con el hash/IOC reportado usando el EDR disponible.
+  ```
+
+- **Panorama del día**: el resumen diario (`NOTIFY_MODE=daily` o `both`) arranca con un párrafo
+  generado por Groq (una sola vez por día, no por item) que sintetiza qué tipo de amenaza dominó,
+  qué requiere atención inmediata, y en qué controles conviene enfocarse — antes de la lista de
+  siempre con el top 5 del día.
+
+Si Groq falla o no responde, ambas mejoras se omiten en silencio y el mensaje se manda igual sin
+ellas (nunca bloquean el envío de la alerta base).
+
+---
+
 ## Formato de alerta
 
 El ícono de prioridad (🔴🟠🟡) va acompañado del ícono de categoría (💀 ransomware, 🎣 phishing,
@@ -379,6 +405,8 @@ cti_bot/
 - [x] Fuentes ThreatFox e INCIBE-CERT
 - [x] Alertas de configuración (API keys inválidas/faltantes) al dueño del bot
 - [x] Correlación de CVEs e IOCs entre fuentes
+- [x] Remediación priorizada (Groq) para items P1/correlacionados
+- [x] Panorama diario generado por IA en el resumen
 - [ ] Ingesta desde canales Telegram vía Telethon
 - [ ] Dashboard web (Streamlit)
 - [ ] Migración a Claude API en producción

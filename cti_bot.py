@@ -572,6 +572,145 @@ def classify(title: str, desc: str, source: str = "") -> dict:
                 )
             raise
 
+# ── Remediación priorizada (segundo prompt, solo P1/correlacionados) ──
+# No es parte de la clasificación: es una llamada extra a Groq, solo para los items de
+# más alto valor (P1 de fuentes clasificadas por LLM, o cualquiera que haya correlacionado
+# con un CVE/IOC ya confirmado), para pasar de "esto pasó" a "esto es lo que hacés hoy".
+# Se omite para las fuentes SOURCE_DEFAULTS (CISA KEV, URLhaus, ThreatFox, etc.): esas ya
+# son suficientemente específicas y accionables por sí mismas, no necesitan el prompt extra.
+REMEDIATION_PROMPT = """\
+Sos un analista SOC senior asesorando a un colega en una PyME con recursos limitados.
+Dado este evento de seguridad ya clasificado, dale las 2-3 acciones MÁS URGENTES a tomar
+hoy, en orden de prioridad, y qué evidencia concreta buscar en el propio entorno para
+confirmar si están expuestos.
+
+Evento: {title}
+Categoría: {category} | Severidad: {severity}
+Motivo: {sme_reason}
+{correlation_note}
+
+Reglas:
+- Máximo 3 acciones, en una lista numerada
+- Cada acción en 1-2 líneas cortas: qué hacer + dónde/cómo verificar exposición
+  (ej. "revisar logs de firewall de los últimos 7 días por conexiones salientes a X")
+- Directo y técnico, sin relleno, sin repetir el resumen del evento
+- Respondé en español, texto plano (sin markdown, sin JSON)"""
+
+def get_remediation(result: dict) -> str | None:
+    correlation_note = ""
+    if result.get("correlated"):
+        indicators = ", ".join(c for c, _ in result["correlated"][:3])
+        correlation_note = f"Nota: este evento correlaciona con indicadores ya confirmados hoy: {indicators}"
+
+    prompt = REMEDIATION_PROMPT.format(
+        title=result["title"][:150],
+        category=result["category"],
+        severity=result["severity"],
+        sme_reason=result["sme_reason"],
+        correlation_note=correlation_note,
+    )
+
+    for attempt in range(2):
+        try:
+            resp = client_groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+                temperature=0.2,
+            )
+            text = resp.choices[0].message.content.strip()
+            if not text:
+                return None
+            if len(text) > 800:
+                text = text[:800].rsplit("\n", 1)[0]
+            return text
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate_limit" in err_str.lower():
+                wait = 10 * (attempt + 1)
+                m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
+                if m:
+                    wait = float(m.group(1)) + 1
+                logger.warning(f"Rate limit Groq (remediación), esperando {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            if "401" in err_str or "invalid_api_key" in err_str.lower():
+                flag_config_issue(
+                    "groq_auth",
+                    "Groq: la API key configurada es inválida (401). Generá una nueva en "
+                    "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
+                )
+            logger.warning(f"get_remediation() falló, se omite: {str(e)[:100]}")
+            return None
+    return None
+
+# ── Panorama ejecutivo diario (segundo prompt, 1 vez por día) ─────────
+# Se llama una sola vez al armar el resumen diario (get_daily_summary), no por item, así
+# que el costo en tokens no escala con el volumen de la corrida. Si falla, el resumen
+# diario se manda igual sin el párrafo (degradación suave, ver get_daily_summary()).
+DAILY_EXEC_SUMMARY_PROMPT = """\
+Sos un analista SOC senior armando el brief ejecutivo diario para el dueño de una PyME
+sin equipo de seguridad dedicado. Con los eventos de hoy (categoría, severidad y si son
+relevantes operacionalmente), escribí un párrafo corto que sintetice:
+- qué tipo de amenaza dominó el día
+- si hay algo que requiera atención inmediata
+- en qué controles o área conviene enfocar los próximos días
+
+Eventos de hoy:
+{events_block}
+
+Reglas:
+- Máximo 5 líneas, un solo párrafo, sin listas ni markdown
+- Directo, sin relleno, sin repetir cada evento uno por uno
+- Sin saludo ni encabezado, arrancá directo con el contenido
+- Respondé en español"""
+
+def get_daily_exec_summary(con, today: str) -> str | None:
+    rows = con.execute("""
+        SELECT title, category, severity, sme_flag
+        FROM items
+        WHERE ts LIKE ?
+        ORDER BY
+            CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+            sme_flag DESC
+        LIMIT 40
+    """, (f"{today}%",)).fetchall()
+
+    if not rows:
+        return None
+
+    events_block = "\n".join(
+        f"- [{sev}/{'relevante' if sme else 'no relevante'}] {cat}: {title[:100]}"
+        for title, cat, sev, sme in rows
+    )
+    prompt = DAILY_EXEC_SUMMARY_PROMPT.format(events_block=events_block)
+
+    try:
+        resp = client_groq.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        text = resp.choices[0].message.content.strip()
+        if not text:
+            return None
+        if len(text) > 600:
+            # es un párrafo único, sin saltos de línea — cortar en el límite de oración
+            cut = text.rfind(". ", 0, 600)
+            text = text[:cut + 1] if cut > 200 else text[:600].rstrip() + "…"
+        return text
+    except Exception as e:
+        err_str = str(e)
+        if "401" in err_str or "invalid_api_key" in err_str.lower():
+            flag_config_issue(
+                "groq_auth",
+                "Groq: la API key configurada es inválida (401). Generá una nueva en "
+                "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
+            )
+        logger.warning(f"get_daily_exec_summary() falló, se omite: {str(e)[:100]}")
+        return None
+
 # ── Fetch de fuentes ───────────────────────────────────────────
 import httpx
 
@@ -977,6 +1116,11 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
             parts.append(f"{display} ({src})")
         correlation_line = "🎯 Correlaciona con: " + " · ".join(parts)
 
+    remediation_block = ""
+    remediation = item.get("remediation")
+    if remediation:
+        remediation_block = f"🛠️ *Qué hacer:*\n{escape_markdown(remediation)}"
+
     if detail == "minimal":
         msg = f"{icon}{cat_icon} *{title}* — {item['source']}"
         if link:
@@ -999,6 +1143,8 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         )
         if correlation_line:
             msg += f"\n\n{correlation_line}"
+        if remediation_block:
+            msg += f"\n\n{remediation_block}"
         if link:
             msg += f"\n\n🔗 {link}"
         return msg
@@ -1015,6 +1161,8 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     )
     if correlation_line:
         msg += f"\n{correlation_line}"
+    if remediation_block:
+        msg += f"\n\n{remediation_block}"
     if link:
         msg += f"\n🔗 {link}"
     return msg
@@ -1040,6 +1188,11 @@ def get_daily_summary(con) -> str | None:
         return None
 
     lines = ["📋 *Resumen CTI — " + today + "*\n"]
+
+    exec_summary = get_daily_exec_summary(con, today)
+    if exec_summary:
+        lines.append(f"🧠 *Panorama del día:*\n{escape_markdown(exec_summary)}\n")
+
     for i, row in enumerate(rows, 1):
         title, source, category, severity, sme_flag, \
         sme_reason, cis_json, summary = row
@@ -1130,6 +1283,12 @@ async def run():
                     result["sme_relevant"] = True
                     result["correlated"]   = matches
                     logger.info(f"  [CORRELACIÓN] {', '.join(c for c, _ in matches)} ↔ {entry['title'][:50]}")
+
+                if matches or get_priority(result) == 1:
+                    remediation = get_remediation(result)
+                    if remediation:
+                        result["remediation"] = remediation
+                        logger.info(f"  [REMEDIACIÓN] generada para: {entry['title'][:50]}")
 
             logger.info(f"  [{result['severity'].upper()}] {entry['title'][:60]}")
             save_item(con, result)

@@ -113,16 +113,28 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    - P3 🟡: `severity=medium` (no relevante)
    - `severity=low` nunca se envía
 
-6. **Envío por usuario** — se itera sobre todos los `chat_id` conocidos (el del `.env` + los que
+6. **Remediación priorizada (`get_remediation()`)** — segundo prompt a Groq, *solo* para items que
+   no vienen de `SOURCE_DEFAULTS` y que además son P1 o correlacionaron (`get_priority(result) == 1
+   or matches`). No es parte de la clasificación — es una llamada extra, acotada a los items de
+   mayor valor para no escalar el costo en tokens con el volumen de la corrida. Pide 2-3 acciones
+   concretas y en qué evidencia del propio entorno fijarse para confirmar exposición (no solo el
+   tag de control CIS). Falla en silencio (`return None`, se loguea el warning) — si Groq no
+   responde, el item se manda igual sin `result["remediation"]`. Se muestra en el mensaje como
+   `🛠️ *Qué hacer:* ...` (compact y detailed, no en minimal).
+
+7. **Envío por usuario** — se itera sobre todos los `chat_id` conocidos (el del `.env` + los que
    escribieron algún comando y quedaron en `user_config`). Por cada chat_id se recalcula su propio
    filtro (`should_process_for_user()`, usa la config de esa fila) y se formatea el mensaje según
    su `notify_detail` (`format_message_for()`, 3 variantes: compact/detailed/minimal). El envío a
    Telegram reintenta hasta 3 veces con backoff exponencial ante error. El resumen diario
    (`get_daily_summary()`) solo se dispara si `notify_mode` incluye `daily`/`both` **y** la hora UTC
    actual coincide con `DAILY_SUMMARY_HOUR` (ventana de los primeros 10 minutos de esa hora, porque
-   el scheduler corre cada 2hs y no hay garantía de caer justo en el minuto 0).
+   el scheduler corre cada 2hs y no hay garantía de caer justo en el minuto 0). `get_daily_summary()`
+   arma un párrafo de síntesis vía `get_daily_exec_summary()` (tercer prompt a Groq, se corre una
+   sola vez por día, no por item — barato) con los hasta 40 items de mayor severidad del día, y lo
+   antepone a la lista de top 5 de siempre; si falla, el resumen se manda igual sin el párrafo.
 
-7. **Alertas de configuración** — durante el fetch/clasificación, `flag_config_issue(key, msg)`
+8. **Alertas de configuración** — durante el fetch/clasificación, `flag_config_issue(key, msg)`
    detecta fallas por API key inválida/faltante (URLhaus 401/403, ThreatFox 401/403/`unknown_auth_key`,
    NVD 404 con header `message: Invalid apiKey`, Groq 401/`invalid_api_key`) y las junta en
    `CONFIG_ISSUES` (deduplicadas por `key` dentro de la corrida vía `_flagged_this_run`). Al final
@@ -139,7 +151,7 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
 - `user_config` — override de preferencias por `chat_id`, default cuando no hay fila = valores
   globales del `.env` (ver `get_user_config()`).
 - `config_alerts` — throttle diario (`issue_key` → `last_sent`) para no repetir el mismo aviso de
-  configuración más de una vez por día (ver punto 7 de arriba).
+  configuración más de una vez por día (ver punto 8 de arriba).
 
 ### Puntos a tener en cuenta al modificar
 
