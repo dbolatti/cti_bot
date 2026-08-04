@@ -833,22 +833,46 @@ def fetch_rss(source: str, url: str) -> list[dict]:
 
 # ── Correlación de indicadores entre fuentes ───────────────────
 # Cruza lo que trajeron las fuentes estructuradas de alta señal de ESTA MISMA corrida
-# (CISA KEV, EPSS/FIRST) contra el texto de los demás items (ej. una noticia RSS que
-# menciona un CVE que ya está confirmado como explotado activamente). Si hay match,
-# se fuerza sme_relevant=True (la correlación es una confirmación real, no solo una
-# noticia más) y se muestra en el mensaje. No mira historial en cti.db, solo la corrida
-# actual — sin cambios de esquema en la DB.
+# (CVEs de CISA KEV/EPSS, IOCs de URLhaus/ThreatFox) contra el texto de los demás items
+# (ej. una noticia RSS que menciona un CVE o un dominio ya confirmado como activo). Si
+# hay match, se fuerza sme_relevant=True (la correlación es una confirmación real, no
+# solo una noticia más) y se muestra en el mensaje. No mira historial en cti.db, solo la
+# corrida actual — sin cambios de esquema en la DB.
+#
+# La precisión de la extracción de IOCs de texto libre importa poco para el ruido: el
+# filtro real pasa por el match exacto contra el puñado de indicadores confirmados de
+# ESTA corrida (~10-30 valores), no por lo permisiva que sea la regex de extracción.
 CVE_MENTION_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 CVE_CORRELATION_SOURCES = ("CISA KEV", "EPSS/FIRST")
+IOC_CORRELATION_SOURCES = ("Abuse.ch URLhaus", "Abuse.ch ThreatFox")
+
+IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+HASH_RE = re.compile(r"\b[a-fA-F0-9]{64}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{32}\b")
+DOMAIN_RE = re.compile(
+    r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+    r"(?:com|net|org|info|biz|xyz|top|ru|cn|tk|icu|cc|io|co|me|online|site|club|shop|link|live|world|app|dev|[a-z]{2})\b",
+    re.IGNORECASE,
+)
+
+def extract_iocs(text: str) -> set[str]:
+    """Candidatos a IOC (IPs, dominios, hashes) en un texto libre, normalizados."""
+    found = {m.lower() for m in IPV4_RE.findall(text)}
+    found |= {m.lower() for m in DOMAIN_RE.findall(text)}
+    found |= {m.lower() for m in HASH_RE.findall(text)}
+    return found
 
 def build_correlation_index(all_entries: list[dict]) -> dict:
     cve_sources: dict[str, set] = {}
+    ioc_sources: dict[str, set] = {}
     for entry in all_entries:
-        if entry["source"] not in CVE_CORRELATION_SOURCES:
-            continue
-        for cve in CVE_MENTION_RE.findall(f"{entry['title']} {entry['desc']}"):
-            cve_sources.setdefault(cve.upper(), set()).add(entry["source"])
-    return {"cve_sources": cve_sources}
+        text = f"{entry['title']} {entry['desc']}"
+        if entry["source"] in CVE_CORRELATION_SOURCES:
+            for cve in CVE_MENTION_RE.findall(text):
+                cve_sources.setdefault(cve.upper(), set()).add(entry["source"])
+        if entry["source"] in IOC_CORRELATION_SOURCES:
+            for ioc in extract_iocs(text):
+                ioc_sources.setdefault(ioc, set()).add(entry["source"])
+    return {"cve_sources": cve_sources, "ioc_sources": ioc_sources}
 
 def find_cve_correlations(text: str, index: dict) -> list[tuple[str, str]]:
     """Devuelve [(CVE, 'fuente1, fuente2'), ...] para los CVEs del texto que también
@@ -863,6 +887,16 @@ def find_cve_correlations(text: str, index: dict) -> list[tuple[str, str]]:
         if sources:
             seen.add(cve)
             found.append((cve, ", ".join(sorted(sources))))
+    return found
+
+def find_ioc_correlations(text: str, index: dict) -> list[tuple[str, str]]:
+    """Devuelve [(IOC, 'fuente1, fuente2'), ...] para los IOCs del texto que también
+    aparecen en URLhaus/ThreatFox de esta corrida."""
+    found = []
+    for ioc in extract_iocs(text):
+        sources = index["ioc_sources"].get(ioc)
+        if sources:
+            found.append((ioc, ", ".join(sorted(sources))))
     return found
 
 # ── Formato Telegram ───────────────────────────────────────────
@@ -937,7 +971,11 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     correlated = item.get("correlated")
     correlation_line = ""
     if correlated:
-        correlation_line = "🎯 Correlaciona con: " + " · ".join(f"{c} ({s})" for c, s in correlated[:3])
+        parts = []
+        for value, src in correlated[:3]:
+            display = value if len(value) <= 24 else f"{value[:20]}…"
+            parts.append(f"{display} ({src})")
+        correlation_line = "🎯 Correlaciona con: " + " · ".join(parts)
 
     if detail == "minimal":
         msg = f"{icon}{cat_icon} *{title}* — {item['source']}"
@@ -1083,7 +1121,11 @@ async def run():
             result["link"]   = entry.get("link", "")
 
             if entry["source"] not in SOURCE_DEFAULTS:
-                matches = find_cve_correlations(f"{entry['title']} {entry['desc']}", correlation_index)
+                entry_text = f"{entry['title']} {entry['desc']}"
+                matches = (
+                    find_cve_correlations(entry_text, correlation_index)
+                    + find_ioc_correlations(entry_text, correlation_index)
+                )
                 if matches:
                     result["sme_relevant"] = True
                     result["correlated"]   = matches

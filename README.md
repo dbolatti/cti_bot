@@ -110,6 +110,27 @@ fallas de configuración/credenciales — errores transitorios de red no generan
 
 ---
 
+## Correlación entre fuentes
+
+Cada corrida cruza los CVEs y los IOCs (IPs, dominios, hashes) que trajeron las fuentes
+estructuradas de alta señal (CISA KEV, EPSS/FIRST, URLhaus, ThreatFox) contra el texto de las
+demás noticias. Si una noticia RSS menciona un CVE o un indicador que ya está confirmado como
+activo en otra fuente, se marca la alerta y se sube su prioridad — es una confirmación real, no
+solo una noticia más:
+
+```
+🔴🔓 P1 · VULN · BleepingComputer
+Atacantes explotan CVE-2026-18577 activamente, alertan investigadores
+CIS-7.3: posible explotación activa según fuentes
+CIS: CIS-7.1 · CIS-7.2
+🎯 Correlaciona con: CVE-2026-18577 (CISA KEV)
+🔗 https://...
+```
+
+Solo mira lo que trajo la corrida actual (no hay historial ni cambios de esquema en `cti.db`).
+
+---
+
 ## Formato de alerta
 
 El ícono de prioridad (🔴🟠🟡) va acompañado del ícono de categoría (💀 ransomware, 🎣 phishing,
@@ -357,10 +378,10 @@ cti_bot/
 - [x] Configuración por chat vía comandos de Telegram
 - [x] Fuentes ThreatFox e INCIBE-CERT
 - [x] Alertas de configuración (API keys inválidas/faltantes) al dueño del bot
+- [x] Correlación de CVEs e IOCs entre fuentes
 - [ ] Ingesta desde canales Telegram vía Telethon
 - [ ] Dashboard web (Streamlit)
 - [ ] Migración a Claude API en producción
-- [ ] Correlación de IOCs entre fuentes
 
 ---
 

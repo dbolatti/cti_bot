@@ -249,3 +249,86 @@ class TestCorrelation:
             "Reporte cubre CVE-2024-3400 y CVE-2023-4966", index
         )
         assert set(matches) == {("CVE-2024-3400", "CISA KEV"), ("CVE-2023-4966", "EPSS/FIRST")}
+
+
+# ── extract_iocs / find_ioc_correlations ────────────────────────
+
+class TestExtractIocs:
+    def test_extracts_ipv4(self):
+        assert "203.0.113.7" in cti_bot.extract_iocs("El C2 corre en 203.0.113.7 según el reporte")
+
+    def test_extracts_ipv4_with_port_strips_port(self):
+        found = cti_bot.extract_iocs("Beacon hacia 203.0.113.7:8080 cada 60s")
+        assert "203.0.113.7" in found
+        assert "203.0.113.7:8080" not in found
+
+    def test_rejects_invalid_ipv4_octets(self):
+        assert cti_bot.extract_iocs("version 999.999.999.999 no es una IP") == set()
+
+    def test_extracts_domain(self):
+        found = cti_bot.extract_iocs("El dominio malicioso xxquzmb.leschatroom.com sirve el payload")
+        assert "xxquzmb.leschatroom.com" in found
+
+    def test_extracts_domain_case_insensitive_normalized_lowercase(self):
+        found = cti_bot.extract_iocs("Dominio EVIL-DOMAIN.COM detectado")
+        assert "evil-domain.com" in found
+
+    def test_extracts_sha256_hash(self):
+        h = "a" * 64
+        assert h in cti_bot.extract_iocs(f"Hash del payload: {h}")
+
+    def test_extracts_md5_hash(self):
+        h = "b" * 32
+        assert h in cti_bot.extract_iocs(f"MD5: {h}")
+
+    def test_no_iocs_in_plain_text(self):
+        assert cti_bot.extract_iocs("Texto sin ningún indicador técnico") == set()
+
+    def test_extracts_from_url(self):
+        found = cti_bot.extract_iocs("URL: http://218.29.22.30:49264/bin.sh | Tags: sin tags")
+        assert "218.29.22.30" in found
+
+
+class TestFindIocCorrelations:
+    def _entry(self, source: str, title: str, desc: str = "") -> dict:
+        return {"id": "x", "title": title, "desc": desc, "source": source, "link": ""}
+
+    def test_index_picks_up_domain_from_threatfox(self):
+        entries = [self._entry(
+            "Abuse.ch ThreatFox",
+            "IOC activo (domain) — Vidar",
+            "IOC: evil-domain.com | Tipo: Domain used for C2 | Malware: Vidar | Confianza: 100%",
+        )]
+        index = cti_bot.build_correlation_index(entries)
+        assert "evil-domain.com" in index["ioc_sources"]
+
+    def test_index_picks_up_ip_from_urlhaus(self):
+        entries = [self._entry(
+            "Abuse.ch URLhaus",
+            "URL maliciosa activa — malware_download",
+            "URL: http://203.0.113.7/payload.exe | Tags: sin tags",
+        )]
+        index = cti_bot.build_correlation_index(entries)
+        assert "203.0.113.7" in index["ioc_sources"]
+
+    def test_index_ignores_iocs_from_regular_rss(self):
+        entries = [self._entry("BleepingComputer", "Investigadores rastrean C2 en evil-domain.com")]
+        index = cti_bot.build_correlation_index(entries)
+        assert index["ioc_sources"] == {}
+
+    def test_find_correlation_match(self):
+        index = {"cve_sources": {}, "ioc_sources": {"evil-domain.com": {"Abuse.ch ThreatFox"}}}
+        matches = cti_bot.find_ioc_correlations(
+            "La campaña usa el dominio evil-domain.com para C2", index
+        )
+        assert matches == [("evil-domain.com", "Abuse.ch ThreatFox")]
+
+    def test_find_correlation_no_match(self):
+        index = {"cve_sources": {}, "ioc_sources": {"evil-domain.com": {"Abuse.ch ThreatFox"}}}
+        matches = cti_bot.find_ioc_correlations("Noticia sin IOCs conocidos", index)
+        assert matches == []
+
+    def test_find_correlation_case_insensitive(self):
+        index = {"cve_sources": {}, "ioc_sources": {"evil-domain.com": {"Abuse.ch ThreatFox"}}}
+        matches = cti_bot.find_ioc_correlations("Dominio EVIL-DOMAIN.COM usado como C2", index)
+        assert matches == [("evil-domain.com", "Abuse.ch ThreatFox")]
