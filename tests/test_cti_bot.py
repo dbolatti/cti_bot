@@ -183,3 +183,69 @@ class TestGetCisControls:
     def test_all_categories_have_controls(self):
         for cat in cti_bot.CIS_MAPPING:
             assert len(cti_bot.get_cis_controls(cat)) > 0
+
+
+# ── build_correlation_index / find_cve_correlations ────────────
+
+class TestCorrelation:
+    def _entry(self, source: str, title: str, desc: str = "") -> dict:
+        return {"id": "x", "title": title, "desc": desc, "source": source, "link": ""}
+
+    def test_index_picks_up_cve_from_cisa_kev(self):
+        entries = [self._entry("CISA KEV", "CVE-2024-3400 — Pan-OS RCE")]
+        index = cti_bot.build_correlation_index(entries)
+        assert "CVE-2024-3400" in index["cve_sources"]
+
+    def test_index_picks_up_cve_from_epss(self):
+        entries = [self._entry("EPSS/FIRST", "CVE-2024-3400 — Pan-Os · EPSS 100.0%")]
+        index = cti_bot.build_correlation_index(entries)
+        assert "CVE-2024-3400" in index["cve_sources"]
+
+    def test_index_ignores_cve_from_regular_rss(self):
+        entries = [self._entry("BleepingComputer", "Ataques explotan CVE-2024-3400 en la naturaleza")]
+        index = cti_bot.build_correlation_index(entries)
+        assert index["cve_sources"] == {}
+
+    def test_index_merges_sources_for_same_cve(self):
+        entries = [
+            self._entry("CISA KEV", "CVE-2024-3400 — Pan-OS RCE"),
+            self._entry("EPSS/FIRST", "CVE-2024-3400 — Pan-Os · EPSS 100.0%"),
+        ]
+        index = cti_bot.build_correlation_index(entries)
+        assert index["cve_sources"]["CVE-2024-3400"] == {"CISA KEV", "EPSS/FIRST"}
+
+    def test_find_correlation_match(self):
+        index = {"cve_sources": {"CVE-2024-3400": {"CISA KEV"}}}
+        matches = cti_bot.find_cve_correlations(
+            "Atacantes explotan CVE-2024-3400 activamente", index
+        )
+        assert matches == [("CVE-2024-3400", "CISA KEV")]
+
+    def test_find_correlation_no_match(self):
+        index = {"cve_sources": {"CVE-2024-3400": {"CISA KEV"}}}
+        matches = cti_bot.find_cve_correlations("Noticia sin CVEs conocidos", index)
+        assert matches == []
+
+    def test_find_correlation_case_insensitive(self):
+        index = {"cve_sources": {"CVE-2024-3400": {"CISA KEV"}}}
+        matches = cti_bot.find_cve_correlations("se explota cve-2024-3400 en la naturaleza", index)
+        assert matches == [("CVE-2024-3400", "CISA KEV")]
+
+    def test_find_correlation_deduplicates_repeated_mentions(self):
+        index = {"cve_sources": {"CVE-2024-3400": {"CISA KEV"}}}
+        matches = cti_bot.find_cve_correlations(
+            "CVE-2024-3400 es grave. Ver también CVE-2024-3400.", index
+        )
+        assert matches == [("CVE-2024-3400", "CISA KEV")]
+
+    def test_find_correlation_multiple_different_cves(self):
+        index = {
+            "cve_sources": {
+                "CVE-2024-3400": {"CISA KEV"},
+                "CVE-2023-4966": {"EPSS/FIRST"},
+            }
+        }
+        matches = cti_bot.find_cve_correlations(
+            "Reporte cubre CVE-2024-3400 y CVE-2023-4966", index
+        )
+        assert set(matches) == {("CVE-2024-3400", "CISA KEV"), ("CVE-2023-4966", "EPSS/FIRST")}

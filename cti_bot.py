@@ -831,6 +831,40 @@ def fetch_rss(source: str, url: str) -> list[dict]:
         })
     return items
 
+# ── Correlación de indicadores entre fuentes ───────────────────
+# Cruza lo que trajeron las fuentes estructuradas de alta señal de ESTA MISMA corrida
+# (CISA KEV, EPSS/FIRST) contra el texto de los demás items (ej. una noticia RSS que
+# menciona un CVE que ya está confirmado como explotado activamente). Si hay match,
+# se fuerza sme_relevant=True (la correlación es una confirmación real, no solo una
+# noticia más) y se muestra en el mensaje. No mira historial en cti.db, solo la corrida
+# actual — sin cambios de esquema en la DB.
+CVE_MENTION_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+CVE_CORRELATION_SOURCES = ("CISA KEV", "EPSS/FIRST")
+
+def build_correlation_index(all_entries: list[dict]) -> dict:
+    cve_sources: dict[str, set] = {}
+    for entry in all_entries:
+        if entry["source"] not in CVE_CORRELATION_SOURCES:
+            continue
+        for cve in CVE_MENTION_RE.findall(f"{entry['title']} {entry['desc']}"):
+            cve_sources.setdefault(cve.upper(), set()).add(entry["source"])
+    return {"cve_sources": cve_sources}
+
+def find_cve_correlations(text: str, index: dict) -> list[tuple[str, str]]:
+    """Devuelve [(CVE, 'fuente1, fuente2'), ...] para los CVEs del texto que también
+    aparecen en las fuentes estructuradas de esta corrida."""
+    found = []
+    seen = set()
+    for cve in CVE_MENTION_RE.findall(text):
+        cve = cve.upper()
+        if cve in seen:
+            continue
+        sources = index["cve_sources"].get(cve)
+        if sources:
+            seen.add(cve)
+            found.append((cve, ", ".join(sorted(sources))))
+    return found
+
 # ── Formato Telegram ───────────────────────────────────────────
 _MARKDOWN_SPECIAL_CHARS = ("_", "*", "[", "`")
 
@@ -900,6 +934,11 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     title    = escape_markdown(item["title"][:100])
     link     = item.get("link", "")
 
+    correlated = item.get("correlated")
+    correlation_line = ""
+    if correlated:
+        correlation_line = "🎯 Correlaciona con: " + " · ".join(f"{c} ({s})" for c, s in correlated[:3])
+
     if detail == "minimal":
         msg = f"{icon}{cat_icon} *{title}* — {item['source']}"
         if link:
@@ -920,6 +959,8 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
             f"_{sme_reason}_\n\n"
             f"*Controles CIS IG1:*\n{cis_line}"
         )
+        if correlation_line:
+            msg += f"\n\n{correlation_line}"
         if link:
             msg += f"\n\n🔗 {link}"
         return msg
@@ -934,6 +975,8 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         f"_{sme}_\n"
         f"CIS: {cis_line}"
     )
+    if correlation_line:
+        msg += f"\n{correlation_line}"
     if link:
         msg += f"\n🔗 {link}"
     return msg
@@ -1025,6 +1068,8 @@ async def run():
             logger.warning(f"{label}: {e}")
 
     # ── Clasificación ─────────────────────────────────────────
+    correlation_index = build_correlation_index(all_entries)
+
     results = []
     for entry in all_entries:
         if is_seen(con, entry["id"]):
@@ -1036,6 +1081,13 @@ async def run():
             result["title"]  = entry["title"]
             result["source"] = entry["source"]
             result["link"]   = entry.get("link", "")
+
+            if entry["source"] not in SOURCE_DEFAULTS:
+                matches = find_cve_correlations(f"{entry['title']} {entry['desc']}", correlation_index)
+                if matches:
+                    result["sme_relevant"] = True
+                    result["correlated"]   = matches
+                    logger.info(f"  [CORRELACIÓN] {', '.join(c for c, _ in matches)} ↔ {entry['title'][:50]}")
 
             logger.info(f"  [{result['severity'].upper()}] {entry['title'][:60]}")
             save_item(con, result)
