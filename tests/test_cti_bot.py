@@ -384,3 +384,60 @@ class TestFindRansomwareGroupCorrelations:
         index = {"ransomware_groups": {"qilin": {"Ransomware.live"}}}
         matches = cti_bot.find_ransomware_group_correlations("mención de tranqilinidad en el texto", index)
         assert matches == []
+
+
+# ── Circuit breaker de rate limit sostenido de Groq ─────────────
+
+class TestGroqCircuitBreaker:
+    def setup_method(self):
+        cti_bot.GROQ_EXHAUSTED = False
+        cti_bot.CONFIG_ISSUES.clear()
+        cti_bot._flagged_this_run.clear()
+
+    def teardown_method(self):
+        cti_bot.GROQ_EXHAUSTED = False
+        cti_bot.CONFIG_ISSUES.clear()
+        cti_bot._flagged_this_run.clear()
+
+    def _fake_rate_limit_create(self, *args, **kwargs):
+        raise Exception("Error code: 429 - {'error': {'message': 'rate_limit_exceeded'}}")
+
+    def test_classify_raises_and_trips_breaker_after_sustained_rate_limit(self, monkeypatch):
+        monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", self._fake_rate_limit_create)
+        monkeypatch.setattr(cti_bot.time, "sleep", lambda s: None)
+
+        with pytest.raises(RuntimeError):
+            cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
+
+        assert cti_bot.GROQ_EXHAUSTED is True
+        assert any(k == "groq_rate_limit" for k, _ in cti_bot.CONFIG_ISSUES)
+
+    def test_classify_fails_fast_once_breaker_tripped(self, monkeypatch):
+        cti_bot.GROQ_EXHAUSTED = True
+        calls = []
+
+        def fake_create(*args, **kwargs):
+            calls.append(1)
+            raise Exception("no debería llegar a llamarse")
+
+        monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", fake_create)
+
+        with pytest.raises(RuntimeError):
+            cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
+        assert calls == []
+
+    def test_classify_bypass_sources_ignore_breaker(self, monkeypatch):
+        cti_bot.GROQ_EXHAUSTED = True
+        result = cti_bot.classify("CVE-2024-3400 — algo", "desc", source="CISA KEV")
+        assert result["severity"] == "high"
+
+    def test_get_remediation_returns_none_when_breaker_tripped(self):
+        cti_bot.GROQ_EXHAUSTED = True
+        result = cti_bot.get_remediation({
+            "title": "x", "category": "malware", "severity": "high", "sme_reason": "y",
+        })
+        assert result is None
+
+    def test_get_daily_exec_summary_returns_none_when_breaker_tripped(self):
+        cti_bot.GROQ_EXHAUSTED = True
+        assert cti_bot.get_daily_exec_summary(None, "2026-01-01") is None

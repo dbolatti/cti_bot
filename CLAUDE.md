@@ -83,11 +83,22 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    - Si la fuente está en `SOURCE_DEFAULTS` (CISA KEV, URLhaus, Ransomware.live, EPSS/FIRST, CERT/CC),
      se **bypassea el LLM** y se usa una clasificación fija (siempre `severity: high`) — estas fuentes
      ya son de alta señal por diseño y no necesitan al LLM para categorizar.
-   - El resto pasa por Groq (`llama3-8b-8192`, elegido para minimizar consumo de tokens) con
+   - El resto pasa por Groq (`llama-3.1-8b-instant`, elegido para minimizar consumo de tokens) con
      `CLASSIFY_PROMPT`, que exige respuesta JSON estricta con `category`, `severity`, `sme_relevant`,
      `sme_reason` (debe referenciar un control CIS v8.1 IG1 concreto) y `summary`.
    - Cada item clasificado se persiste con `save_item()` en la tabla `items` (incluye los controles
      CIS ya resueltos como JSON, vía `get_cis_controls()` / `CIS_MAPPING`).
+   - **Circuit breaker de rate limit sostenido** (`GROQ_EXHAUSTED`): `classify()` reintenta hasta 3
+     veces con backoff ante 429, pero si el 3er intento también rate-limitea, se asume que es
+     sostenido (cuota diaria agotada o límite de requests/minuto saturado, no un pico transitorio) —
+     se marca `GROQ_EXHAUSTED=True` vía `_groq_mark_exhausted()` (dispara un `flag_config_issue()`
+     con key `groq_rate_limit`, mismo mecanismo que las alertas de config) y se corta Groq para el
+     resto de la corrida: `classify()` levanta de inmediato sin reintentar, `get_remediation()` y
+     `get_daily_exec_summary()` devuelven `None` sin llamar a la API. Los items sin clasificar
+     quedan pendientes para la próxima corrida (`is_seen()` los vuelve a traer, no se pierden). Se
+     resetea a `False` al principio de cada `run()`. Antes de este fix, `classify()` no relanzaba
+     explícitamente tras agotar los 3 intentos por rate limit — devolvía `None` implícito y
+     explotaba con un `TypeError` confuso en el llamador; ahora relanza `RuntimeError` explícito.
 
 4. **Correlación de indicadores (`build_correlation_index()`)** — antes de clasificar, se indexan
    los CVEs, IOCs (IPs/dominios/hashes) y grupos de ransomware mencionados por las fuentes

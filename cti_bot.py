@@ -514,12 +514,39 @@ def validate_classification(result: dict) -> dict:
     result["summary"]      = str(result["summary"])[:400]
     return result
 
+# ── Circuit breaker: rate limit sostenido de Groq ──────────────────────
+# Si Groq devuelve 429 de forma sostenida (cuota diaria agotada o límite de
+# requests/minuto saturado), reintentar por cada item desperdicia minutos sin
+# lograr nada — con hasta 2 llamadas a Groq por item (clasificación + posible
+# remediación), una corrida grande puede tardar muchísimo. En cuanto UN item
+# agota sus propios reintentos por rate limit, se corta Groq para el resto de
+# la corrida: los items sin clasificar quedan pendientes para la próxima
+# (is_seen() los vuelve a traer, no se pierden), y el resto del pipeline
+# (fuentes bypasseadas, envío de lo ya clasificado) sigue funcionando normal.
+GROQ_EXHAUSTED = False
+
+def _groq_mark_exhausted():
+    global GROQ_EXHAUSTED
+    if not GROQ_EXHAUSTED:
+        GROQ_EXHAUSTED = True
+        flag_config_issue(
+            "groq_rate_limit",
+            "Groq: rate limit sostenido durante la corrida (cuota agotada o límite de "
+            "requests/minuto superado). Se pausó la clasificación/remediación por IA por el "
+            "resto de esta corrida — los items pendientes se procesan en la próxima. Si se "
+            "repite seguido, considerá espaciar más las corridas o revisar tu plan en "
+            "https://console.groq.com/settings/billing"
+        )
+
 def classify(title: str, desc: str, source: str = "") -> dict:
     if source in SOURCE_DEFAULTS:
         result = SOURCE_DEFAULTS[source].copy()
         result["summary"] = title[:120]
         return validate_classification(result)
-    
+
+    if GROQ_EXHAUSTED:
+        raise RuntimeError("Groq: rate limit sostenido, se omite hasta la próxima corrida")
+
     time.sleep(1.5)   # ← agregá esto antes de la llamada a Groq
 
     for attempt in range(3):
@@ -555,10 +582,12 @@ def classify(title: str, desc: str, source: str = "") -> dict:
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "rate_limit" in err_str.lower():
+                if attempt == 2:
+                    _groq_mark_exhausted()
+                    raise RuntimeError(f"Groq: rate limit sostenido tras 3 intentos: {title[:40]!r}") from e
                 # extraer tiempo de espera del mensaje de error si está disponible
                 wait = 10 * (attempt + 1)
-                import re as _re
-                m = _re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
+                m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
                 if m:
                     wait = float(m.group(1)) + 1
                 logger.warning(f"Rate limit Groq, esperando {wait:.0f}s (intento {attempt+1}/3)")
@@ -571,6 +600,7 @@ def classify(title: str, desc: str, source: str = "") -> dict:
                     "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
                 )
             raise
+    raise RuntimeError(f"Groq: no se pudo clasificar tras 3 intentos: {title[:40]!r}")
 
 # ── Remediación priorizada (segundo prompt, solo P1/correlacionados) ──
 # No es parte de la clasificación: es una llamada extra a Groq, solo para los items de
@@ -597,6 +627,9 @@ Reglas:
 - Respondé en español, texto plano (sin markdown, sin JSON)"""
 
 def get_remediation(result: dict) -> str | None:
+    if GROQ_EXHAUSTED:
+        return None
+
     correlation_note = ""
     if result.get("correlated"):
         indicators = ", ".join(c for c, _ in result["correlated"][:3])
@@ -627,6 +660,9 @@ def get_remediation(result: dict) -> str | None:
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "rate_limit" in err_str.lower():
+                if attempt == 1:
+                    _groq_mark_exhausted()
+                    return None
                 wait = 10 * (attempt + 1)
                 m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
                 if m:
@@ -666,6 +702,9 @@ Reglas:
 - Respondé en español"""
 
 def get_daily_exec_summary(con, today: str) -> str | None:
+    if GROQ_EXHAUSTED:
+        return None
+
     rows = con.execute("""
         SELECT title, category, severity, sme_flag
         FROM items
@@ -1252,6 +1291,8 @@ async def run():
 
     CONFIG_ISSUES.clear()
     _flagged_this_run.clear()
+    global GROQ_EXHAUSTED
+    GROQ_EXHAUSTED = False
 
     # ── Procesar comandos entrantes ───────────────────────────
     try:
