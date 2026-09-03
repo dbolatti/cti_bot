@@ -9,7 +9,11 @@ clasifica cada evento con IA (Groq como proveedor principal, OpenRouter como fal
 y envía alertas priorizadas a Telegram.
 Desarrollado en el marco de investigación sobre ciberseguridad para PyMEs (CINAPTIC / UTN FRRe).
 
-Todo el proyecto vive en un único script: `cti_bot.py`. Hay tests en `tests/` (pytest), pero no
+El pipeline vive en un único script: `cti_bot.py`. `setup.py` es un asistente interactivo aparte
+para la primera configuración (arma el `.env` validando cada credencial con una llamada real al
+proveedor — ver su docstring). Hay tests en `tests/` (pytest, incluye `test_setup.py` para la
+lógica pura de `setup.py`; las funciones `validate_*` que llaman a APIs reales no se testean por
+pytest, se verifican a mano igual que `classify()`/`get_remediation()` en `cti_bot.py`), pero no
 linter ni build configurados.
 
 ## Entorno virtual

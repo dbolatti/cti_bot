@@ -244,7 +244,21 @@ pip install -r requirements.txt
 
 ### 4. Configurar credenciales
 
-Copiá `.env.example` a `.env`:
+**Opción recomendada — asistente interactivo:**
+
+```bash
+python setup.py
+```
+
+Te pide el token de Telegram (y lo valida), detecta el `chat_id` automáticamente
+(solo tenés que escribirle un mensaje a tu bot cuando te lo pida), y valida cada API
+key con una llamada real al proveedor antes de guardarla — nada de copiar y pegar a
+ciegas en un archivo de texto. Si algo falla, te deja reintentar u omitirlo. Al final
+escribe el `.env` por vos. Las preferencias de notificación se pueden ajustar después
+en cualquier momento hablándole al bot (`/modo`, `/detalle`, `/prioridad`), así que el
+asistente no te las pregunta en detalle.
+
+**Opción manual:**
 
 ```bash
 cp .env.example .env    # Linux/Mac
@@ -405,6 +419,7 @@ python cti_bot.py
 ```
 cti_bot/
 ├── cti_bot.py        # script principal
+├── setup.py          # asistente interactivo de primera configuración
 ├── tests/            # tests unitarios (pytest) de las funciones puras
 ├── scripts/          # helpers de pre-commit (chequeo de archivos sensibles)
 ├── .env              # credenciales y configuración local (no se sube)
@@ -435,6 +450,7 @@ cti_bot/
 - [x] Remediación priorizada (IA) para items P1/correlacionados
 - [x] Panorama diario generado por IA en el resumen
 - [x] Fallback automático a OpenRouter si Groq falla de forma sostenida
+- [x] Asistente interactivo de primera configuración (`setup.py`)
 - [ ] Ingesta desde canales Telegram vía Telethon
 - [ ] Dashboard web (Streamlit)
 - [ ] Migración a Claude API en producción
