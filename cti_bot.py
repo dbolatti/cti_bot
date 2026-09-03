@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from groq import Groq
+from openai import OpenAI
 from telegram import Bot, LinkPreviewOptions
 from dotenv import load_dotenv
 
@@ -50,7 +50,16 @@ load_dotenv()
 
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+
+# ── Proveedores de IA: Groq como principal, OpenRouter como fallback ────
+# automático si Groq falla de forma sostenida (rate limit agotado, key
+# inválida, o un modelo dado de baja — nos pasó antes con llama3-8b-8192).
+# Ambos exponen una API compatible con OpenAI, así que se usa un solo SDK
+# (openai) apuntando a distinta base_url según el proveedor activo.
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
+GROQ_MODEL          = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct")
 
 # chat_ids autorizados a controlar el bot y recibir alertas.
 # Por defecto solo el owner (TELEGRAM_CHAT_ID); se puede sumar otros vía ALLOWED_CHAT_IDS.
@@ -63,13 +72,17 @@ def validate_config():
         name for name, val in (
             ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
             ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
-            ("GROQ_API_KEY", GROQ_API_KEY),
         )
         if not val
     ]
     if missing:
         raise SystemExit(
             f"[FATAL] Faltan variables de entorno obligatorias en .env: {', '.join(missing)}"
+        )
+    if not GROQ_API_KEY and not OPENROUTER_API_KEY:
+        raise SystemExit(
+            "[FATAL] Falta configurar al menos un proveedor de IA en .env: "
+            "GROQ_API_KEY u OPENROUTER_API_KEY"
         )
 
 # ── Configuración de notificaciones ──────────────────────────
@@ -461,8 +474,18 @@ def save_item(con, item: dict):
     )
     con.commit()
 
-# ── Clasificación con Groq ─────────────────────────────────────
-client_groq = Groq(api_key=GROQ_API_KEY)
+# ── Clasificación con IA (Groq principal, OpenRouter como fallback) ────
+# Ambos exponen un endpoint compatible con OpenAI, así que se usa el mismo
+# SDK para los dos, cambiando solo base_url/api_key/modelo.
+client_groq = OpenAI(api_key=GROQ_API_KEY or "unset", base_url="https://api.groq.com/openai/v1")
+client_openrouter = OpenAI(
+    api_key=OPENROUTER_API_KEY or "unset",
+    base_url="https://openrouter.ai/api/v1",
+    default_headers={
+        "HTTP-Referer": "https://github.com/dbolatti/cti_bot",
+        "X-Title": "CTI_BOT",
+    },
+)
 
 CLASSIFY_PROMPT = """\
 Sos un analista de ciberseguridad especializado en pequeñas y medianas empresas.
@@ -514,29 +537,111 @@ def validate_classification(result: dict) -> dict:
     result["summary"]      = str(result["summary"])[:400]
     return result
 
-# ── Circuit breaker: rate limit sostenido de Groq ──────────────────────
-# Si Groq devuelve 429 de forma sostenida (cuota diaria agotada o límite de
-# requests/minuto saturado), reintentar por cada item desperdicia minutos sin
-# lograr nada — con hasta 2 llamadas a Groq por item (clasificación + posible
-# remediación), una corrida grande puede tardar muchísimo. En cuanto UN item
-# agota sus propios reintentos por rate limit, se corta Groq para el resto de
-# la corrida: los items sin clasificar quedan pendientes para la próxima
-# (is_seen() los vuelve a traer, no se pierden), y el resto del pipeline
-# (fuentes bypasseadas, envío de lo ya clasificado) sigue funcionando normal.
-GROQ_EXHAUSTED = False
+# ── Circuit breaker + fallback automático entre proveedores de IA ──────
+# Si el proveedor activo (Groq por defecto) falla de forma sostenida — rate
+# limit agotado, key inválida, o un modelo dado de baja (nos pasó antes con
+# llama3-8b-8192) — reintentar por cada item desperdicia minutos sin lograr
+# nada. _llm_complete() centraliza el reintento y, si el proveedor activo
+# se agota, cambia automáticamente al otro (si está configurado) para el
+# resto de la corrida. Si ambos fallan, se corta la IA por completo: los
+# items sin clasificar quedan pendientes para la próxima corrida (is_seen()
+# los vuelve a traer, no se pierden), y el resto del pipeline (fuentes
+# bypasseadas, envío de lo ya clasificado) sigue funcionando normal.
+ACTIVE_LLM     = "groq" if GROQ_API_KEY else "openrouter"
+LLM_EXHAUSTED  = False
 
-def _groq_mark_exhausted():
-    global GROQ_EXHAUSTED
-    if not GROQ_EXHAUSTED:
-        GROQ_EXHAUSTED = True
+def _llm_client_and_model():
+    if ACTIVE_LLM == "openrouter":
+        return client_openrouter, OPENROUTER_MODEL, "OpenRouter"
+    return client_groq, GROQ_MODEL, "Groq"
+
+def _is_model_error(err_str: str) -> bool:
+    low = err_str.lower()
+    return any(s in low for s in ("decommissioned", "model_not_found", "does not exist"))
+
+def _llm_switch_to_fallback(reason: str) -> bool:
+    """Si el proveedor activo es Groq y hay una OPENROUTER_API_KEY configurada,
+    cambia a OpenRouter para el resto de la corrida. Devuelve False si no hay
+    a qué cambiar (ya se está en el fallback, o no hay key de OpenRouter)."""
+    global ACTIVE_LLM
+    if ACTIVE_LLM == "groq" and OPENROUTER_API_KEY:
+        ACTIVE_LLM = "openrouter"
         flag_config_issue(
-            "groq_rate_limit",
-            "Groq: rate limit sostenido durante la corrida (cuota agotada o límite de "
-            "requests/minuto superado). Se pausó la clasificación/remediación por IA por el "
-            "resto de esta corrida — los items pendientes se procesan en la próxima. Si se "
-            "repite seguido, considerá espaciar más las corridas o revisar tu plan en "
-            "https://console.groq.com/settings/billing"
+            "llm_fallback",
+            f"Groq falló ({reason}) — el bot cambió automáticamente a OpenRouter para el "
+            f"resto de esta corrida. La próxima corrida vuelve a intentar con Groq primero."
         )
+        return True
+    return False
+
+def _llm_mark_exhausted(provider_name: str, reason: str):
+    global LLM_EXHAUSTED
+    if not LLM_EXHAUSTED:
+        LLM_EXHAUSTED = True
+        flag_config_issue(
+            "llm_exhausted",
+            f"IA: {provider_name} falló ({reason}) y no queda otro proveedor disponible "
+            f"(¿configuraste GROQ_API_KEY y OPENROUTER_API_KEY?). Se pausó la "
+            f"clasificación/remediación por IA por el resto de esta corrida — los items "
+            f"pendientes se procesan en la próxima."
+        )
+
+def _llm_complete(messages: list[dict], max_tokens: int, temperature: float) -> str:
+    """Pide una respuesta al proveedor de IA activo, con reintentos ante rate
+    limit. Si el proveedor falla de forma sostenida, cambia automáticamente
+    al fallback (una sola vez) y reintenta con él; si también falla, activa
+    el circuit breaker para el resto de la corrida."""
+    if LLM_EXHAUSTED:
+        raise RuntimeError("IA: no queda proveedor disponible, se omite hasta la próxima corrida")
+
+    already_switched = False
+    while True:
+        client, model, provider_name = _llm_client_and_model()
+        reason = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate_limit" in err_str.lower():
+                    if attempt == 2:
+                        reason = "rate limit sostenido"
+                        break
+                    wait = 10 * (attempt + 1)
+                    m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
+                    if m:
+                        wait = float(m.group(1)) + 1
+                    logger.warning(f"Rate limit {provider_name}, esperando {wait:.0f}s (intento {attempt+1}/3)")
+                    time.sleep(wait)
+                    continue
+                if "401" in err_str or "invalid_api_key" in err_str.lower():
+                    flag_config_issue(
+                        "llm_auth",
+                        f"{provider_name}: la API key configurada es inválida (401). "
+                        f"Revisala en .env."
+                    )
+                    reason = "API key inválida"
+                    break
+                if _is_model_error(err_str):
+                    logger.warning(f"{provider_name}: modelo no disponible — {err_str[:150]}")
+                    reason = "modelo dado de baja"
+                    break
+                raise  # error no manejado: no reintentar ni cambiar de proveedor
+
+        if already_switched:
+            _llm_mark_exhausted(provider_name, reason)
+            raise RuntimeError(f"IA: {provider_name} falló ({reason}) y ya no hay más proveedores")
+        if not _llm_switch_to_fallback(reason):
+            _llm_mark_exhausted(provider_name, reason)
+            raise RuntimeError(f"IA: {provider_name} falló ({reason}) y no hay fallback configurado")
+        already_switched = True
+        # vuelve a intentar con el nuevo proveedor activo
 
 def classify(title: str, desc: str, source: str = "") -> dict:
     if source in SOURCE_DEFAULTS:
@@ -544,15 +649,11 @@ def classify(title: str, desc: str, source: str = "") -> dict:
         result["summary"] = title[:120]
         return validate_classification(result)
 
-    if GROQ_EXHAUSTED:
-        raise RuntimeError("Groq: rate limit sostenido, se omite hasta la próxima corrida")
-
     time.sleep(1.5)   # ← agregá esto antes de la llamada a Groq
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            resp = client_groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
+            raw = _llm_complete(
                 messages=[
                     {
                         "role": "user",
@@ -565,7 +666,6 @@ def classify(title: str, desc: str, source: str = "") -> dict:
                 max_tokens=300,
                 temperature=0.0 if attempt > 0 else 0.1,
             )
-            raw = resp.choices[0].message.content.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -574,33 +674,12 @@ def classify(title: str, desc: str, source: str = "") -> dict:
             result = json.loads(raw.strip())
             return validate_classification(result)
         except json.JSONDecodeError:
-            if attempt < 2:
+            if attempt == 0:
                 logger.warning(f"JSON inválido en classify(), reintentando: {title[:40]!r}")
                 time.sleep(1)
                 continue
             raise
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate_limit" in err_str.lower():
-                if attempt == 2:
-                    _groq_mark_exhausted()
-                    raise RuntimeError(f"Groq: rate limit sostenido tras 3 intentos: {title[:40]!r}") from e
-                # extraer tiempo de espera del mensaje de error si está disponible
-                wait = 10 * (attempt + 1)
-                m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
-                if m:
-                    wait = float(m.group(1)) + 1
-                logger.warning(f"Rate limit Groq, esperando {wait:.0f}s (intento {attempt+1}/3)")
-                time.sleep(wait)
-                continue
-            if "401" in err_str or "invalid_api_key" in err_str.lower():
-                flag_config_issue(
-                    "groq_auth",
-                    "Groq: la API key configurada es inválida (401). Generá una nueva en "
-                    "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
-                )
-            raise
-    raise RuntimeError(f"Groq: no se pudo clasificar tras 3 intentos: {title[:40]!r}")
+    raise RuntimeError(f"classify(): no se pudo obtener JSON válido: {title[:40]!r}")
 
 # ── Remediación priorizada (segundo prompt, solo P1/correlacionados) ──
 # No es parte de la clasificación: es una llamada extra a Groq, solo para los items de
@@ -627,9 +706,6 @@ Reglas:
 - Respondé en español, texto plano (sin markdown, sin JSON)"""
 
 def get_remediation(result: dict) -> str | None:
-    if GROQ_EXHAUSTED:
-        return None
-
     correlation_note = ""
     if result.get("correlated"):
         indicators = ", ".join(c for c, _ in result["correlated"][:3])
@@ -643,42 +719,21 @@ def get_remediation(result: dict) -> str | None:
         correlation_note=correlation_note,
     )
 
-    for attempt in range(2):
-        try:
-            resp = client_groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.2,
-            )
-            text = resp.choices[0].message.content.strip()
-            if not text:
-                return None
-            if len(text) > 800:
-                text = text[:800].rsplit("\n", 1)[0]
-            return text
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate_limit" in err_str.lower():
-                if attempt == 1:
-                    _groq_mark_exhausted()
-                    return None
-                wait = 10 * (attempt + 1)
-                m = re.search(r"try again in (\d+(?:\.\d+)?)s", err_str)
-                if m:
-                    wait = float(m.group(1)) + 1
-                logger.warning(f"Rate limit Groq (remediación), esperando {wait:.0f}s")
-                time.sleep(wait)
-                continue
-            if "401" in err_str or "invalid_api_key" in err_str.lower():
-                flag_config_issue(
-                    "groq_auth",
-                    "Groq: la API key configurada es inválida (401). Generá una nueva en "
-                    "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
-                )
-            logger.warning(f"get_remediation() falló, se omite: {str(e)[:100]}")
-            return None
-    return None
+    try:
+        text = _llm_complete(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning(f"get_remediation() falló, se omite: {str(e)[:100]}")
+        return None
+
+    if not text:
+        return None
+    if len(text) > 800:
+        text = text[:800].rsplit("\n", 1)[0]
+    return text
 
 # ── Panorama ejecutivo diario (segundo prompt, 1 vez por día) ─────────
 # Se llama una sola vez al armar el resumen diario (get_daily_summary), no por item, así
@@ -702,7 +757,7 @@ Reglas:
 - Respondé en español"""
 
 def get_daily_exec_summary(con, today: str) -> str | None:
-    if GROQ_EXHAUSTED:
+    if LLM_EXHAUSTED:
         return None
 
     rows = con.execute("""
@@ -725,30 +780,22 @@ def get_daily_exec_summary(con, today: str) -> str | None:
     prompt = DAILY_EXEC_SUMMARY_PROMPT.format(events_block=events_block)
 
     try:
-        resp = client_groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        text = _llm_complete(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
             temperature=0.3,
         )
-        text = resp.choices[0].message.content.strip()
-        if not text:
-            return None
-        if len(text) > 600:
-            # es un párrafo único, sin saltos de línea — cortar en el límite de oración
-            cut = text.rfind(". ", 0, 600)
-            text = text[:cut + 1] if cut > 200 else text[:600].rstrip() + "…"
-        return text
     except Exception as e:
-        err_str = str(e)
-        if "401" in err_str or "invalid_api_key" in err_str.lower():
-            flag_config_issue(
-                "groq_auth",
-                "Groq: la API key configurada es inválida (401). Generá una nueva en "
-                "https://console.groq.com/keys y actualizá GROQ_API_KEY en .env"
-            )
         logger.warning(f"get_daily_exec_summary() falló, se omite: {str(e)[:100]}")
         return None
+
+    if not text:
+        return None
+    if len(text) > 600:
+        # es un párrafo único, sin saltos de línea — cortar en el límite de oración
+        cut = text.rfind(". ", 0, 600)
+        text = text[:cut + 1] if cut > 200 else text[:600].rstrip() + "…"
+    return text
 
 # ── Fetch de fuentes ───────────────────────────────────────────
 import httpx
@@ -1187,7 +1234,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     if detail == "minimal":
         msg = f"{icon}{cat_icon} *{title}* — {item['source']}"
         if link:
-            msg += f"\n🔗 {link}"
+            msg += f"\n🔗 [Ver más]({link})"
         return msg
 
     if detail == "detailed":
@@ -1209,7 +1256,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         if remediation_block:
             msg += f"\n\n{remediation_block}"
         if link:
-            msg += f"\n\n🔗 {link}"
+            msg += f"\n\n🔗 [Ver más]({link})"
         return msg
 
     # compact (default)
@@ -1227,7 +1274,7 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
     if remediation_block:
         msg += f"\n\n{remediation_block}"
     if link:
-        msg += f"\n🔗 {link}"
+        msg += f"\n🔗 [Ver más]({link})"
     return msg
 
 def get_daily_summary(con) -> str | None:
@@ -1291,8 +1338,9 @@ async def run():
 
     CONFIG_ISSUES.clear()
     _flagged_this_run.clear()
-    global GROQ_EXHAUSTED
-    GROQ_EXHAUSTED = False
+    global ACTIVE_LLM, LLM_EXHAUSTED
+    ACTIVE_LLM    = "groq" if GROQ_API_KEY else "openrouter"
+    LLM_EXHAUSTED = False
 
     # ── Procesar comandos entrantes ───────────────────────────
     try:

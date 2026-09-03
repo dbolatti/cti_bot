@@ -5,15 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Qué es este proyecto
 
 Pipeline personal de Cyber Threat Intelligence (CTI): ingesta feeds RSS y APIs de seguridad,
-clasifica cada evento con un LLM (Groq/Llama3), y envía alertas priorizadas a Telegram.
+clasifica cada evento con IA (Groq como proveedor principal, OpenRouter como fallback automático),
+y envía alertas priorizadas a Telegram.
 Desarrollado en el marco de investigación sobre ciberseguridad para PyMEs (CINAPTIC / UTN FRRe).
 
-Todo el proyecto vive en un único script: `cti_bot.py`. No hay tests, linter ni build configurados.
+Todo el proyecto vive en un único script: `cti_bot.py`. Hay tests en `tests/` (pytest), pero no
+linter ni build configurados.
 
 ## Entorno virtual
 
 Existe un venv en `venv/` con todas las dependencias de `requirements.txt` ya instaladas
-(`feedparser`, `groq`, `python-telegram-bot`, `httpx`, `python-dotenv`). **Usar siempre el
+(`feedparser`, `openai`, `python-telegram-bot`, `httpx`, `python-dotenv`, `pytest`). **Usar siempre el
 intérprete del venv para correr o probar código de este repo** — el Python global del sistema
 no tiene estas dependencias instaladas.
 
@@ -49,7 +51,8 @@ sincrónica del pipeline (`asyncio.run(run())`), no un proceso long-running/daem
 
 Todo se controla vía `.env` (plantilla en `.env.example`, nunca commitear `.env` real):
 
-- `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `GROQ_API_KEY`, `NVD_API_KEY` (opcional, para enriquecer EPSS)
+- `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `NVD_API_KEY` (opcional, para enriquecer EPSS)
+- Al menos uno de `GROQ_API_KEY` / `OPENROUTER_API_KEY` (ver sección de proveedores de IA abajo)
 - `SEND_PRIORITY_UP_TO` (1-3), `NOTIFY_MODE` (realtime|daily|both), `NOTIFY_DETAIL` (compact|detailed|minimal),
   `SME_ONLY`, `CATEGORIES`, `DAILY_SUMMARY_HOUR`
 
@@ -83,22 +86,37 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    - Si la fuente está en `SOURCE_DEFAULTS` (CISA KEV, URLhaus, Ransomware.live, EPSS/FIRST, CERT/CC),
      se **bypassea el LLM** y se usa una clasificación fija (siempre `severity: high`) — estas fuentes
      ya son de alta señal por diseño y no necesitan al LLM para categorizar.
-   - El resto pasa por Groq (`llama-3.1-8b-instant`, elegido para minimizar consumo de tokens) con
-     `CLASSIFY_PROMPT`, que exige respuesta JSON estricta con `category`, `severity`, `sme_relevant`,
-     `sme_reason` (debe referenciar un control CIS v8.1 IG1 concreto) y `summary`.
+   - El resto pasa por IA vía `_llm_complete()` con `CLASSIFY_PROMPT`, que exige respuesta JSON
+     estricta con `category`, `severity`, `sme_relevant`, `sme_reason` (debe referenciar un control
+     CIS v8.1 IG1 concreto) y `summary`.
    - Cada item clasificado se persiste con `save_item()` en la tabla `items` (incluye los controles
      CIS ya resueltos como JSON, vía `get_cis_controls()` / `CIS_MAPPING`).
-   - **Circuit breaker de rate limit sostenido** (`GROQ_EXHAUSTED`): `classify()` reintenta hasta 3
-     veces con backoff ante 429, pero si el 3er intento también rate-limitea, se asume que es
-     sostenido (cuota diaria agotada o límite de requests/minuto saturado, no un pico transitorio) —
-     se marca `GROQ_EXHAUSTED=True` vía `_groq_mark_exhausted()` (dispara un `flag_config_issue()`
-     con key `groq_rate_limit`, mismo mecanismo que las alertas de config) y se corta Groq para el
-     resto de la corrida: `classify()` levanta de inmediato sin reintentar, `get_remediation()` y
-     `get_daily_exec_summary()` devuelven `None` sin llamar a la API. Los items sin clasificar
-     quedan pendientes para la próxima corrida (`is_seen()` los vuelve a traer, no se pierden). Se
-     resetea a `False` al principio de cada `run()`. Antes de este fix, `classify()` no relanzaba
-     explícitamente tras agotar los 3 intentos por rate limit — devolvía `None` implícito y
-     explotaba con un `TypeError` confuso en el llamador; ahora relanza `RuntimeError` explícito.
+   - **Dos proveedores de IA con fallback automático**: Groq es el principal (`GROQ_MODEL`, default
+     `qwen/qwen3.8-27b` — Groq deprecó `llama3-8b-8192` y después `llama-3.1-8b-instant`, así que el
+     modelo quedó configurable por `.env` para no depender de que el código se actualice cada vez que
+     Groq jubila un modelo). Elegido tras comparar varios modelos de Groq disponibles: los `openai/gpt-oss-*`
+     son modelos "de razonamiento" que gastan el presupuesto de `max_tokens` pensando antes de escribir
+     la respuesta (con 300-400 tokens, `gpt-oss-20b` devolvía `content` vacío) y `groq/compound`/`groq/compound-mini`
+     son sistemas agénticos que por dentro corren en un modelo mucho más pesado (`llama-3.3-70b-versatile`)
+     y consumen muchísimos más tokens de entrada (~3300 vs ~350) — pegan rate limit fácil, no son
+     buena opción para clasificación simple de alto volumen. OpenRouter (`OPENROUTER_MODEL`, default
+     `meta-llama/llama-3.1-8b-instruct`) es el fallback si está configurado. Ambos usan el SDK de
+     `openai` apuntando a distinta `base_url` (`client_groq`, `client_openrouter` en `cti_bot.py`),
+     porque los dos exponen un endpoint compatible con OpenAI.
+   - **`_llm_complete()`** centraliza la llamada+reintentos+fallback para los tres call sites
+     (`classify()`, `get_remediation()`, `get_daily_exec_summary()`). Ante 429 reintenta hasta 3
+     veces con backoff; si el proveedor activo falla de forma sostenida (rate limit agotado tras 3
+     intentos, key inválida con 401, o un modelo dado de baja — detectado por `_is_model_error()`
+     buscando "decommissioned"/"model_not_found"/"does not exist" en el mensaje de error), intenta
+     **cambiar automáticamente al otro proveedor** vía `_llm_switch_to_fallback()` (solo si el activo
+     es Groq y hay `OPENROUTER_API_KEY` configurada) y avisa por Telegram (`flag_config_issue()`,
+     key `llm_fallback`). Si el fallback también falla, o no hay a qué cambiar, se activa
+     `LLM_EXHAUSTED=True` (key `llm_exhausted`) y se corta la IA para el resto de la corrida:
+     `classify()` levanta de inmediato, `get_remediation()`/`get_daily_exec_summary()` devuelven
+     `None` sin llamar a la API. Los items sin clasificar quedan pendientes para la próxima corrida
+     (`is_seen()` los vuelve a traer, no se pierden). `ACTIVE_LLM`/`LLM_EXHAUSTED` se resetean al
+     principio de cada `run()` (`ACTIVE_LLM` arranca en `"groq"` si hay `GROQ_API_KEY`, si no en
+     `"openrouter"` directamente).
 
 4. **Correlación de indicadores (`build_correlation_index()`)** — antes de clasificar, se indexan
    los CVEs, IOCs (IPs/dominios/hashes) y grupos de ransomware mencionados por las fuentes
@@ -137,14 +155,14 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    - P3 🟡: `severity=medium` (no relevante)
    - `severity=low` nunca se envía
 
-6. **Remediación priorizada (`get_remediation()`)** — segundo prompt a Groq, *solo* para items que
+6. **Remediación priorizada (`get_remediation()`)** — segundo prompt a la IA, *solo* para items que
    no vienen de `SOURCE_DEFAULTS` y que además son P1 o correlacionaron (`get_priority(result) == 1
    or matches`). No es parte de la clasificación — es una llamada extra, acotada a los items de
    mayor valor para no escalar el costo en tokens con el volumen de la corrida. Pide 2-3 acciones
    concretas y en qué evidencia del propio entorno fijarse para confirmar exposición (no solo el
-   tag de control CIS). Falla en silencio (`return None`, se loguea el warning) — si Groq no
-   responde, el item se manda igual sin `result["remediation"]`. Se muestra en el mensaje como
-   `🛠️ *Qué hacer:* ...` (compact y detailed, no en minimal).
+   tag de control CIS). Falla en silencio (`return None`, se loguea el warning) — si la IA no
+   responde (o ningún proveedor está disponible), el item se manda igual sin `result["remediation"]`.
+   Se muestra en el mensaje como `🛠️ *Qué hacer:* ...` (compact y detailed, no en minimal).
 
 7. **Envío por usuario** — se itera sobre todos los `chat_id` conocidos (el del `.env` + los que
    escribieron algún comando y quedaron en `user_config`). Por cada chat_id se recalcula su propio
@@ -154,13 +172,13 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
    (`get_daily_summary()`) solo se dispara si `notify_mode` incluye `daily`/`both` **y** la hora UTC
    actual coincide con `DAILY_SUMMARY_HOUR` (ventana de los primeros 10 minutos de esa hora, porque
    el scheduler corre cada 2hs y no hay garantía de caer justo en el minuto 0). `get_daily_summary()`
-   arma un párrafo de síntesis vía `get_daily_exec_summary()` (tercer prompt a Groq, se corre una
+   arma un párrafo de síntesis vía `get_daily_exec_summary()` (tercer prompt a la IA, se corre una
    sola vez por día, no por item — barato) con los hasta 40 items de mayor severidad del día, y lo
    antepone a la lista de top 5 de siempre; si falla, el resumen se manda igual sin el párrafo.
 
 8. **Alertas de configuración** — durante el fetch/clasificación, `flag_config_issue(key, msg)`
    detecta fallas por API key inválida/faltante (URLhaus 401/403, ThreatFox 401/403/`unknown_auth_key`,
-   NVD 404 con header `message: Invalid apiKey`, Groq 401/`invalid_api_key`) y las junta en
+   NVD 404 con header `message: Invalid apiKey`, Groq/OpenRouter 401/`invalid_api_key`) y las junta en
    `CONFIG_ISSUES` (deduplicadas por `key` dentro de la corrida vía `_flagged_this_run`). Al final
    del fetch+clasificación, si hay issues nuevos (no avisados hoy, `should_alert_config_issue()`),
    se manda **un solo mensaje consolidado al dueño del bot** (`TELEGRAM_CHAT_ID`, no a todos los
@@ -191,3 +209,10 @@ Pipeline síncrono de una sola pasada (`run()` al final del archivo), en este or
 - Al agregar una fuente nueva que requiera API key, agregar también la detección de key
   inválida/faltante con `flag_config_issue()` (ver patrón en `fetch_urlhaus`/`fetch_threatfox`) para
   que el dueño se entere por Telegram en vez de tener la fuente muerta en silencio en los logs.
+- En `format_message_for()`, el link SIEMPRE va envuelto en sintaxis de link inline
+  `[Ver más]({link})`, nunca crudo. Los links de URLhaus/ThreatFox son URLs armadas por atacantes
+  (no bajo control nuestro) que pueden traer un número impar de `_`/`*`/`` ` `` — insertados crudos,
+  Telegram responde `400 Can't parse entities: can't find end of the entity` y el mensaje no se
+  envía (pasó en una corrida real el 2026-09-03). Dentro del href de un link esos caracteres no se
+  interpretan como formato, así que no hace falta (ni conviene) pasarlos por `escape_markdown()` —
+  eso rompería la URL real.

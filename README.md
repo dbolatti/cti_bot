@@ -9,7 +9,7 @@ Desarrollado como herramienta de inteligencia operacional en el marco de la inve
 ## Características
 
 - Ingesta de múltiples fuentes: RSS, CISA KEV, Abuse.ch URLhaus/ThreatFox, Ransomware.live, EPSS/FIRST
-- Clasificación automática con LLM (Groq / Llama 3.1) con bypass para fuentes de categoría conocida
+- Clasificación automática con IA (Groq como principal, con fallback automático a OpenRouter si Groq falla) con bypass para fuentes de categoría conocida
 - Sistema de prioridad P1–P3 con filtro configurable
 - Razón técnica alineada a controles CIS Controls v8.1 IG1 en cada alerta
 - Deduplicación mediante SQLite — no se repiten alertas ya procesadas
@@ -18,6 +18,7 @@ Desarrollado como herramienta de inteligencia operacional en el marco de la inve
 - Filtros por categoría, severidad y relevancia operacional
 - Configuración por chat vía comandos de Telegram (`/modo`, `/detalle`, `/prioridad`, `/filtro`, `/sme`) — cada usuario puede tener sus propias preferencias sin tocar el `.env`
 - Alertas de configuración: si una API key queda inválida o falta, el dueño del bot recibe un aviso por Telegram con la causa y cómo corregirla (1 vez por día por problema)
+- Fallback automático de IA: si Groq falla de forma sostenida (rate limit agotado, key inválida, o un modelo dado de baja), el bot cambia solo a OpenRouter por el resto de esa corrida, sin intervención manual
 
 ---
 
@@ -91,9 +92,9 @@ defecto para chats que nunca escribieron un comando.
 
 ## Alertas de configuración
 
-Si una fuente que requiere API key (Groq, NVD, URLhaus, ThreatFox) empieza a fallar por una key
-inválida o faltante, el bot no se queda solo logueando el error: le manda al dueño (`TELEGRAM_CHAT_ID`)
-un mensaje explicando qué falló y cómo corregirlo, por ejemplo:
+Si una fuente que requiere API key (Groq, OpenRouter, NVD, URLhaus, ThreatFox) empieza a fallar por
+una key inválida o faltante, el bot no se queda solo logueando el error: le manda al dueño
+(`TELEGRAM_CHAT_ID`) un mensaje explicando qué falló y cómo corregirlo, por ejemplo:
 
 ```
 ⚠️ Problemas de configuración detectados
@@ -138,11 +139,11 @@ Solo mira lo que trajo la corrida actual (no hay historial ni cambios de esquema
 
 ## Remediación priorizada y panorama diario (IA)
 
-Además de clasificar, el bot usa Groq para dos cosas más, acotadas para no disparar el costo en
-tokens con el volumen de la corrida:
+Además de clasificar, el bot usa IA (Groq, o el proveedor de fallback si Groq no responde) para dos
+cosas más, acotadas para no disparar el costo en tokens con el volumen de la corrida:
 
 - **Qué hacer ahora**: para los items más críticos (P1, o cualquiera que haya correlacionado con
-  un CVE/IOC confirmado), un segundo prompt le pide a Groq 2-3 acciones concretas y en qué fijarse
+  un CVE/IOC confirmado), un segundo prompt le pide a la IA 2-3 acciones concretas y en qué fijarse
   en el propio entorno para confirmar exposición — no solo el tag de control CIS:
 
   ```
@@ -153,12 +154,12 @@ tokens con el volumen de la corrida:
   ```
 
 - **Panorama del día**: el resumen diario (`NOTIFY_MODE=daily` o `both`) arranca con un párrafo
-  generado por Groq (una sola vez por día, no por item) que sintetiza qué tipo de amenaza dominó,
+  generado por IA (una sola vez por día, no por item) que sintetiza qué tipo de amenaza dominó,
   qué requiere atención inmediata, y en qué controles conviene enfocarse — antes de la lista de
   siempre con el top 5 del día.
 
-Si Groq falla o no responde, ambas mejoras se omiten en silencio y el mensaje se manda igual sin
-ellas (nunca bloquean el envío de la alerta base).
+Si la IA falla o no responde (ningún proveedor disponible), ambas mejoras se omiten en silencio y
+el mensaje se manda igual sin ellas (nunca bloquean el envío de la alerta base).
 
 ---
 
@@ -207,7 +208,7 @@ Controles CIS IG1:
 ## Requisitos
 
 - Python 3.10+
-- Cuenta en [Groq](https://console.groq.com) (gratuita)
+- Cuenta en [Groq](https://console.groq.com) (gratuita) y/o [OpenRouter](https://openrouter.ai) — hace falta al menos una
 - Bot de Telegram creado vía [@BotFather](https://t.me/BotFather)
 
 ---
@@ -262,7 +263,17 @@ Todos los parámetros se gestionan desde el archivo `.env`:
 # ── Credenciales ──────────────────────────────────────────────
 TELEGRAM_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=987654321
+
+# ── Proveedores de IA: hace falta configurar al menos uno ──────
+# Groq es el principal. Si falla de forma sostenida (rate limit agotado, key
+# inválida, o un modelo dado de baja), el bot cambia solo a OpenRouter para
+# el resto de esa corrida, si está configurado.
 GROQ_API_KEY=gsk_...
+GROQ_MODEL=qwen/qwen3.8-27b
+
+# Fallback opcional — generar en https://openrouter.ai/keys
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct
 
 # chat_ids adicionales autorizados a usar comandos del bot y recibir alertas
 # (separados por coma). El owner (TELEGRAM_CHAT_ID) siempre está autorizado;
@@ -320,6 +331,17 @@ URLHAUS_API_KEY=
 1. Registrate en [console.groq.com](https://console.groq.com)
 2. Andá a API Keys → Create
 3. Copiá la key (empieza con `gsk_`)
+4. Los modelos disponibles cambian con el tiempo (Groq ya deprecó `llama3-8b-8192` y después
+   `llama-3.1-8b-instant`) — revisá [console.groq.com/docs/models](https://console.groq.com/docs/models)
+   y ajustá `GROQ_MODEL` en `.env` si el default deja de funcionar, sin tocar código
+
+### Obtener la OpenRouter API Key (fallback, opcional)
+
+1. Registrate en [openrouter.ai](https://openrouter.ai)
+2. Generá una key en [openrouter.ai/keys](https://openrouter.ai/keys) — empieza con `sk-or-v1-`
+   (en minúscula, es case-sensitive)
+3. Ver modelos disponibles en [openrouter.ai/models](https://openrouter.ai/models) si querés cambiar
+   `OPENROUTER_MODEL`
 
 ### Obtener el Auth-Key de abuse.ch (URLhaus + ThreatFox)
 
@@ -398,7 +420,7 @@ cti_bot/
 ## Roadmap
 
 - [x] Ingesta RSS de fuentes de alta señal
-- [x] Clasificación con LLM (Groq / Llama3)
+- [x] Clasificación con IA (Groq)
 - [x] Bypass LLM para fuentes de categoría conocida
 - [x] Sistema de prioridad P1/P2/P3
 - [x] Mapeo a controles CIS Controls v8.1 IG1
@@ -410,8 +432,9 @@ cti_bot/
 - [x] Fuentes ThreatFox e INCIBE-CERT
 - [x] Alertas de configuración (API keys inválidas/faltantes) al dueño del bot
 - [x] Correlación de CVEs, IOCs y grupos de ransomware entre fuentes
-- [x] Remediación priorizada (Groq) para items P1/correlacionados
+- [x] Remediación priorizada (IA) para items P1/correlacionados
 - [x] Panorama diario generado por IA en el resumen
+- [x] Fallback automático a OpenRouter si Groq falla de forma sostenida
 - [ ] Ingesta desde canales Telegram vía Telethon
 - [ ] Dashboard web (Streamlit)
 - [ ] Migración a Claude API en producción

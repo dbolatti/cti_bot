@@ -8,10 +8,11 @@ import sys
 
 import pytest
 
-# Set dummy env vars before importing so the Groq client instantiates without a real key
+# Set dummy env vars before importing so the LLM clients instantiate without real keys
 os.environ.setdefault("TELEGRAM_TOKEN", "123456:test_token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "123456")
 os.environ.setdefault("GROQ_API_KEY", "test_key")
+os.environ.setdefault("OPENROUTER_API_KEY", "test_key")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import cti_bot
@@ -386,34 +387,74 @@ class TestFindRansomwareGroupCorrelations:
         assert matches == []
 
 
-# ── Circuit breaker de rate limit sostenido de Groq ─────────────
+# ── Circuit breaker + fallback automático Groq → OpenRouter ─────
 
-class TestGroqCircuitBreaker:
+class TestLLMCircuitBreaker:
     def setup_method(self):
-        cti_bot.GROQ_EXHAUSTED = False
+        cti_bot.ACTIVE_LLM = "groq"
+        cti_bot.LLM_EXHAUSTED = False
         cti_bot.CONFIG_ISSUES.clear()
         cti_bot._flagged_this_run.clear()
 
     def teardown_method(self):
-        cti_bot.GROQ_EXHAUSTED = False
+        cti_bot.ACTIVE_LLM = "groq"
+        cti_bot.LLM_EXHAUSTED = False
         cti_bot.CONFIG_ISSUES.clear()
         cti_bot._flagged_this_run.clear()
 
     def _fake_rate_limit_create(self, *args, **kwargs):
         raise Exception("Error code: 429 - {'error': {'message': 'rate_limit_exceeded'}}")
 
-    def test_classify_raises_and_trips_breaker_after_sustained_rate_limit(self, monkeypatch):
+    def _fake_model_decommissioned_create(self, *args, **kwargs):
+        raise Exception("Error code: 400 - {'error': {'message': 'model_decommissioned'}}")
+
+    def _fake_success_create(self, *args, **kwargs):
+        class FakeMessage:
+            content = '{"category": "malware", "severity": "high", "sme_relevant": true, "sme_reason": "x", "summary": "y"}'
+
+        class FakeChoice:
+            message = FakeMessage()
+
+        class FakeResp:
+            choices = [FakeChoice()]
+
+        return FakeResp()
+
+    def test_classify_switches_to_openrouter_after_sustained_groq_rate_limit(self, monkeypatch):
         monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", self._fake_rate_limit_create)
+        monkeypatch.setattr(cti_bot.client_openrouter.chat.completions, "create", self._fake_success_create)
+        monkeypatch.setattr(cti_bot.time, "sleep", lambda s: None)
+
+        result = cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
+
+        assert result["category"] == "malware"
+        assert cti_bot.ACTIVE_LLM == "openrouter"
+        assert cti_bot.LLM_EXHAUSTED is False
+        assert any(k == "llm_fallback" for k, _ in cti_bot.CONFIG_ISSUES)
+
+    def test_classify_switches_to_openrouter_on_model_decommissioned(self, monkeypatch):
+        monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", self._fake_model_decommissioned_create)
+        monkeypatch.setattr(cti_bot.client_openrouter.chat.completions, "create", self._fake_success_create)
+        monkeypatch.setattr(cti_bot.time, "sleep", lambda s: None)
+
+        result = cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
+
+        assert result["category"] == "malware"
+        assert cti_bot.ACTIVE_LLM == "openrouter"
+
+    def test_classify_raises_and_trips_breaker_when_both_providers_fail(self, monkeypatch):
+        monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", self._fake_rate_limit_create)
+        monkeypatch.setattr(cti_bot.client_openrouter.chat.completions, "create", self._fake_rate_limit_create)
         monkeypatch.setattr(cti_bot.time, "sleep", lambda s: None)
 
         with pytest.raises(RuntimeError):
             cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
 
-        assert cti_bot.GROQ_EXHAUSTED is True
-        assert any(k == "groq_rate_limit" for k, _ in cti_bot.CONFIG_ISSUES)
+        assert cti_bot.LLM_EXHAUSTED is True
+        assert any(k == "llm_exhausted" for k, _ in cti_bot.CONFIG_ISSUES)
 
     def test_classify_fails_fast_once_breaker_tripped(self, monkeypatch):
-        cti_bot.GROQ_EXHAUSTED = True
+        cti_bot.LLM_EXHAUSTED = True
         calls = []
 
         def fake_create(*args, **kwargs):
@@ -421,23 +462,77 @@ class TestGroqCircuitBreaker:
             raise Exception("no debería llegar a llamarse")
 
         monkeypatch.setattr(cti_bot.client_groq.chat.completions, "create", fake_create)
+        monkeypatch.setattr(cti_bot.client_openrouter.chat.completions, "create", fake_create)
 
         with pytest.raises(RuntimeError):
             cti_bot.classify("Titulo", "Desc", source="BleepingComputer")
         assert calls == []
 
     def test_classify_bypass_sources_ignore_breaker(self, monkeypatch):
-        cti_bot.GROQ_EXHAUSTED = True
+        cti_bot.LLM_EXHAUSTED = True
         result = cti_bot.classify("CVE-2024-3400 — algo", "desc", source="CISA KEV")
         assert result["severity"] == "high"
 
     def test_get_remediation_returns_none_when_breaker_tripped(self):
-        cti_bot.GROQ_EXHAUSTED = True
+        cti_bot.LLM_EXHAUSTED = True
         result = cti_bot.get_remediation({
             "title": "x", "category": "malware", "severity": "high", "sme_reason": "y",
         })
         assert result is None
 
     def test_get_daily_exec_summary_returns_none_when_breaker_tripped(self):
-        cti_bot.GROQ_EXHAUSTED = True
+        cti_bot.LLM_EXHAUSTED = True
         assert cti_bot.get_daily_exec_summary(None, "2026-01-01") is None
+
+    def test_switch_to_fallback_returns_false_if_already_on_openrouter(self):
+        cti_bot.ACTIVE_LLM = "openrouter"
+        assert cti_bot._llm_switch_to_fallback("motivo de prueba") is False
+
+    def test_switch_to_fallback_returns_false_without_openrouter_key(self, monkeypatch):
+        monkeypatch.setattr(cti_bot, "OPENROUTER_API_KEY", "")
+        assert cti_bot._llm_switch_to_fallback("motivo de prueba") is False
+        assert cti_bot.ACTIVE_LLM == "groq"
+
+
+# ── format_message_for: links con caracteres especiales de Markdown ─────
+# URLhaus/ThreatFox traen URLs armadas por atacantes (infraestructura real,
+# no bajo nuestro control) que pueden tener un número impar de "_"/"*"/"`" —
+# insertar el link crudo en el mensaje hace que Telegram falle con "can't
+# find end of the entity" (pasó en una corrida real el 2026-09-03). El fix
+# es envolver el link en sintaxis de link inline [texto](url): dentro del
+# href de un link, esos caracteres no se interpretan como formato.
+
+class TestFormatMessageForLink:
+    def _item(self, link: str) -> dict:
+        return {
+            "category": "malware",
+            "severity": "high",
+            "sme_relevant": True,
+            "sme_reason": "CIS-8.1: x",
+            "summary": "resumen",
+            "title": "Titulo de prueba",
+            "source": "Abuse.ch URLhaus",
+            "link": link,
+        }
+
+    def test_compact_wraps_link_with_odd_underscore_in_markdown_link_syntax(self):
+        item = self._item("http://evil.tld/a_b/c")
+        msg = cti_bot.format_message_for(item, 1, "compact")
+        assert "[Ver más](http://evil.tld/a_b/c)" in msg
+
+    def test_minimal_wraps_link_in_markdown_link_syntax(self):
+        item = self._item("http://evil.tld/x*y")
+        msg = cti_bot.format_message_for(item, 1, "minimal")
+        assert "[Ver más](http://evil.tld/x*y)" in msg
+
+    def test_detailed_wraps_link_in_markdown_link_syntax(self):
+        item = self._item("http://evil.tld/a`b")
+        msg = cti_bot.format_message_for(item, 1, "detailed")
+        assert "[Ver más](http://evil.tld/a`b)" in msg
+
+    def test_link_url_itself_is_not_escaped(self):
+        # el link va dentro de (), no debe pasar por escape_markdown (rompería la URL real)
+        item = self._item("http://evil.tld/a_b_c_d")
+        msg = cti_bot.format_message_for(item, 1, "compact")
+        assert "a_b_c_d" in msg
+        assert "a\\_b\\_c\\_d" not in msg

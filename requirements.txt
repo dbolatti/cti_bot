@@ -1,5 +1,5 @@
 feedparser
-groq
+openai
 python-telegram-bot
 httpx
 python-dotenv
