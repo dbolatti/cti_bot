@@ -1,3 +1,4 @@
+import argparse
 import feedparser
 import html
 import sqlite3
@@ -13,6 +14,9 @@ from datetime import datetime, timezone
 from openai import OpenAI
 from telegram import Bot, LinkPreviewOptions
 from dotenv import load_dotenv
+
+# ── Módulo propio: clasificador de incidentes en sectores críticos ───────
+import incident_classifier as ic
 
 # ── Consola UTF-8 (Windows) ────────────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -114,6 +118,7 @@ FEEDS = {
 LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
 
 DB_PATH = "cti.db"
+FAST_CHECK_DB_PATH = "cti_fast.db"
 
 # Mapeo categoría → controles CIS v8 IG1 relevantes
 CIS_MAPPING = {
@@ -244,8 +249,57 @@ def init_db():
         con.execute("ALTER TABLE user_config ADD COLUMN last_daily_summary TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    # migration: incident classifier fields
+    for col, typ in (
+        ("critical_sector", "TEXT"),
+        ("incident_severity", "TEXT"),
+        ("threat_actor", "TEXT"),
+        ("sector_evidence", "TEXT"),
+    ):
+        try:
+            con.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     con.commit()
     return con
+
+
+def init_fast_check_db():
+    """Inicializa la BD ligera solo para deduplicación de --fast-check.
+
+    Guarda solo (id, ts) — evita el overhead de la tabla items completa.
+    Se purga automáticamente cada 7 días.
+    """
+    con = sqlite3.connect(FAST_CHECK_DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS fast_items (
+            id    TEXT PRIMARY KEY,
+            ts    TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS fast_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    # purga entradas > 7 días
+    cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=7)).isoformat()
+    con.execute("DELETE FROM fast_items WHERE ts < ?", (cutoff,))
+    con.commit()
+    return con
+
+
+def is_fast_seen(con, item_id: str) -> bool:
+    return con.execute("SELECT 1 FROM fast_items WHERE id=?", (item_id,)).fetchone() is not None
+
+
+def save_fast_item(con, item_id: str):
+    con.execute(
+        "INSERT OR IGNORE INTO fast_items (id, ts) VALUES (?, ?)",
+        (item_id, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit()
 
 def should_alert_config_issue(con, issue_key: str) -> bool:
     """True si este problema de config todavía no se avisó hoy (throttle diario)."""
@@ -462,14 +516,22 @@ def save_item(con, item: dict):
     controls = get_cis_controls(item["category"])
     cis_json = json.dumps([c[0] for c in controls])
     con.execute(
-        "INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,?,?,?,?)",
+        """INSERT OR IGNORE INTO items
+           (id, title, source, category, severity, sme_flag, sme_reason,
+            cis_controls, summary, ts, critical_sector, incident_severity,
+            threat_actor, sector_evidence)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             item["id"], item["title"], item["source"],
             item["category"], item["severity"],
             1 if item["sme_relevant"] else 0,
             item["sme_reason"], cis_json,
             item["summary"],
-            datetime.now(timezone.utc).isoformat()
+            datetime.now(timezone.utc).isoformat(),
+            item.get("critical_sector"),
+            item.get("incident_severity"),
+            item.get("threat_actor"),
+            item.get("sector_evidence"),
         )
     )
     con.commit()
@@ -1277,6 +1339,92 @@ def format_message_for(item: dict, priority: int, detail: str = "compact") -> st
         msg += f"\n🔗 [Ver más]({link})"
     return msg
 
+
+def format_message_for_critical(item: dict, priority: int, detail: str = "compact") -> str:
+    """Plantilla diferenciada para incidentes CRITICAL/HIGH en sectores críticos.
+
+    Incluye: emoji de sector (🏛️/🏦), badge de severidad INCIDENTE, actor si conocido,
+    y enlace. Mantiene el mismo estilo MarkdownV2 que el resto del bot.
+    """
+    # Badge de severidad del incidente (no la prioridad P1/P2/P3)
+    inc_sev = item.get("incident_severity", "HIGH")
+    inc_badge = {"CRITICAL": "🚨 *CRITICAL*", "HIGH": "🔴 *HIGH*", "MEDIUM": "🟡 *MEDIUM*"}.get(inc_sev, "🔴 *HIGH*")
+
+    sector = item.get("critical_sector")
+    sector_label = ic.SECTOR_LABELS.get(sector, "Sector crítico")
+    sector_icon = ic.SECTOR_ICONS.get(sector, "🚨")
+
+    cat      = CATEGORY_LABEL.get(item["category"], "INFO")
+    cat_icon = CATEGORY_ICON.get(item["category"], "📌")
+    title    = escape_markdown(item["title"][:100])
+    link     = item.get("link", "")
+    actor    = item.get("threat_actor")
+
+    correlated = item.get("correlated")
+    correlation_line = ""
+    if correlated:
+        parts = []
+        for value, src in correlated[:3]:
+            display = value if len(value) <= 24 else f"{value[:20]}…"
+            parts.append(f"{display} ({src})")
+        correlation_line = "🎯 Correlaciona con: " + " · ".join(parts)
+
+    remediation_block = ""
+    remediation = item.get("remediation")
+    if remediation:
+        remediation_block = f"🛠️ *Qué hacer:*\n{escape_markdown(remediation)}"
+
+    if detail == "minimal":
+        msg = f"{inc_badge} {sector_icon} *{title}* — {item['source']}"
+        if actor:
+            msg += f" | Actor: {escape_markdown(actor)}"
+        if link:
+            msg += f"\n🔗 [Ver más]({link})"
+        return msg
+
+    if detail == "detailed":
+        controls = get_cis_controls(item["category"])
+        cis_line = "\n".join(f"  • `{c[0]}` {c[1]}" for c in controls)
+        sme_reason = escape_markdown(item["sme_reason"][:150])
+        actor_line = f"\n🎭 *Actor:* {escape_markdown(actor)}" if actor else ""
+        evidence_line = ""
+        if item.get("sector_evidence"):
+            evidence_line = f"\n🔍 *Evidencia sector:* {escape_markdown(item['sector_evidence'])}"
+        msg = (
+            f"{inc_badge} {sector_icon} *{sector_label}* · {cat} · {item['source']}\n"
+            f"*{title}*\n\n"
+            f"_{sme_reason}_\n\n"
+            f"{actor_line}"
+            f"{evidence_line}\n\n"
+            f"*Controles CIS IG1:*\n{cis_line}"
+        )
+        if correlation_line:
+            msg += f"\n\n{correlation_line}"
+        if remediation_block:
+            msg += f"\n\n{remediation_block}"
+        if link:
+            msg += f"\n\n🔗 [Ver más]({link})"
+        return msg
+
+    # compact (default)
+    controls = get_cis_controls(item["category"])
+    cis_line = " · ".join(f"`{c[0]}`" for c in controls[:2])
+    sme      = escape_markdown(item["sme_reason"][:120])
+    actor_line = f" | Actor: {escape_markdown(actor)}" if actor else ""
+    msg = (
+        f"{inc_badge} {sector_icon} P{priority} · {sector_label} · {cat} · {item['source']}\n"
+        f"*{title}*\n"
+        f"_{sme}_\n"
+        f"CIS: {cis_line}{actor_line}"
+    )
+    if correlation_line:
+        msg += f"\n{correlation_line}"
+    if remediation_block:
+        msg += f"\n\n{remediation_block}"
+    if link:
+        msg += f"\n🔗 [Ver más]({link})"
+    return msg
+
 def get_daily_summary(con) -> str | None:
     today = datetime.now(timezone.utc).date().isoformat()
     rows = con.execute("""
@@ -1386,6 +1534,31 @@ async def run():
             result["source"] = entry["source"]
             result["link"]   = entry.get("link", "")
 
+            # ── Clasificador de sectores críticos (gobierno/financiero) ──────
+            # Aplica a todas las fuentes: RSS y APIs. No usa LLM (determinístico).
+            incident = ic.classify_incident(
+                entry["title"], entry["desc"],
+                category=result.get("category", ""), source=entry["source"]
+            )
+            if incident:
+                result.update({
+                    "critical_sector":   incident["critical_sector"],
+                    "incident_severity": incident["incident_severity"],
+                    "threat_actor":      incident["threat_actor"],
+                    "sector_evidence":   incident["sector_evidence"],
+                })
+                # Escalado de severidad y relevancia operacional
+                if incident["incident_severity"] in ("CRITICAL", "HIGH"):
+                    result["severity"] = "high"
+                    result["sme_relevant"] = True
+                    # Si no había sme_reason del LLM (SOURCE_DEFAULTS), poner uno
+                    if not result.get("sme_reason"):
+                        sector_label = ic.SECTOR_LABELS.get(incident["critical_sector"], "Sector crítico")
+                        result["sme_reason"] = (
+                            f"CIS-13.1: incidente {incident['incident_severity'].lower()} en "
+                            f"{sector_label.lower()}"
+                        )
+
             if entry["source"] not in SOURCE_DEFAULTS:
                 entry_text = f"{entry['title']} {entry['desc']}"
                 matches = (
@@ -1452,7 +1625,11 @@ async def run():
                 if not should_process_for_user(result, cfg):
                     continue
                 priority = get_priority(result)
-                msg = format_message_for(result, priority, cfg["notify_detail"])
+                # Usar plantilla diferenciada para incidentes críticos en sectores críticos
+                if result.get("critical_sector") and result.get("incident_severity") in ("CRITICAL", "HIGH"):
+                    msg = format_message_for_critical(result, priority, cfg["notify_detail"])
+                else:
+                    msg = format_message_for(result, priority, cfg["notify_detail"])
                 for attempt in range(3):
                     try:
                         await bot.send_message(
@@ -1492,5 +1669,108 @@ async def run():
     logger.info(f"[DONE] {sent} alertas enviadas, {errors} errores.")
     con.close()
 
+async def run_fast_check():
+    """Modo rápido: solo fuentes de alta señal (Ransomware.live, CISA KEV)
+    cada 15-30 min. Sin LLM, sin RSS, deduplicación en BD ligera.
+    """
+    validate_config()
+
+    # BD principal para user_config (destinatarios)
+    main_con = init_db()
+    # BD ligera solo para deduplicación de fast-check
+    fast_con = init_fast_check_db()
+    bot = Bot(token=TELEGRAM_TOKEN)
+    sent = 0
+    errors = 0
+
+    logger.info("[FAST-CHECK] Iniciando verificación rápida de incidentes activos")
+
+    # Solo fuentes de incidentes activos confirmados
+    entries = []
+    for label, coro in [
+        ("Ransomware.live",  fetch_ransomware_live()),
+        ("CISA KEV",         fetch_cisa_kev()),
+    ]:
+        logger.info(f"[FAST-FETCH] {label}")
+        try:
+            entries.extend(await coro)
+        except Exception as e:
+            logger.warning(f"{label}: {e}")
+            errors += 1
+
+    # Obtener chat_ids autorizados desde la BD principal
+    chat_ids = {TELEGRAM_CHAT_ID}
+    for row in main_con.execute("SELECT chat_id FROM user_config").fetchall():
+        chat_ids.add(row[0])
+    chat_ids &= ALLOWED_CHAT_IDS
+
+    for entry in entries:
+        if is_fast_seen(fast_con, entry["id"]):
+            logger.debug(f"[FAST-SKIP] {entry['title'][:60]}")
+            continue
+
+        # Categoría heurística (sin LLM para velocidad)
+        category = ic.guess_category(entry["title"], entry["desc"])
+        incident = ic.classify_incident(
+            entry["title"], entry["desc"],
+            category=category, source=entry["source"]
+        )
+
+        if not incident or incident["incident_severity"] == "MEDIUM":
+            save_fast_item(fast_con, entry["id"])
+            continue
+
+        # Construir result mínimo para formateo
+        result = {
+            "id":          entry["id"],
+            "title":       entry["title"],
+            "source":      entry["source"],
+            "link":        entry.get("link", ""),
+            "category":    category,
+            "severity":    "high",
+            "sme_relevant": True,
+            "sme_reason":  f"CIS-13.1: incidente {incident['incident_severity'].lower()} en {ic.SECTOR_LABELS.get(incident['critical_sector'], 'sector crítico').lower()}",
+            "summary":     entry["title"][:120],
+            "critical_sector":   incident["critical_sector"],
+            "incident_severity": incident["incident_severity"],
+            "threat_actor":      incident["threat_actor"],
+            "sector_evidence":   incident["sector_evidence"],
+        }
+
+        save_fast_item(fast_con, entry["id"])
+
+        # Enviar a todos los chats autorizados (sin filtro de modo — fast-check siempre avisa)
+        for chat_id in chat_ids:
+            try:
+                msg = format_message_for_critical(result, 1, "compact")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode="Markdown",
+                    link_preview_options=LINK_PREVIEW_OFF,
+                )
+                sent += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"fast-send a {chat_id}: {e}")
+                errors += 1
+
+    logger.info(f"[FAST-DONE] {sent} alertas rápidas enviadas, {errors} errores.")
+    main_con.close()
+    fast_con.close()
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    parser = argparse.ArgumentParser(
+        description="cti_bot — CTI pipeline + fast-check de incidentes críticos"
+    )
+    parser.add_argument(
+        "--fast-check", action="store_true",
+        help="Modo rápido: solo Ransomware.live + CISA KEV, sin LLM, para polling 15-30 min"
+    )
+    args = parser.parse_args()
+
+    if args.fast_check:
+        asyncio.run(run_fast_check())
+    else:
+        asyncio.run(run())
