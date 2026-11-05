@@ -1,0 +1,1 @@
+'⚙️ *Tu configuración:*\n• Modo: `realtime`\n• Detalle: `compact`\n• Prioridad máx: `P2`\n• Solo SME: `no`\n• Categorías: `todas`\n• Sectores: `all`\n• Severidad mín: `HIGH`\n• Actores seguidos: `—`'

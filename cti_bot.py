@@ -15,8 +15,9 @@ from openai import OpenAI
 from telegram import Bot, LinkPreviewOptions
 from dotenv import load_dotenv
 
-# ── Módulo propio: clasificador de incidentes en sectores críticos ───────
+# ── Módulos propios ──────────────────────────────────────────────────────
 import incident_classifier as ic
+import bot_handlers as bh
 
 # ── Consola UTF-8 (Windows) ────────────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -235,7 +236,10 @@ def init_db():
             sme_only           INTEGER DEFAULT 0,
             categories         TEXT DEFAULT '',
             updated_at         TEXT,
-            last_daily_summary TEXT DEFAULT ''
+            last_daily_summary TEXT DEFAULT '',
+            sectors            TEXT DEFAULT 'all',
+            min_severity       TEXT DEFAULT 'HIGH',
+            followed_actors    TEXT DEFAULT ''
         )
     """)
     con.execute("""
@@ -249,6 +253,16 @@ def init_db():
         con.execute("ALTER TABLE user_config ADD COLUMN last_daily_summary TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    # migration: new user_config columns (interactive bot)
+    for col, typ in (
+        ("sectors", "TEXT DEFAULT 'all'"),
+        ("min_severity", "TEXT DEFAULT 'HIGH'"),
+        ("followed_actors", "TEXT DEFAULT ''"),
+    ):
+        try:
+            con.execute(f"ALTER TABLE user_config ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     # migration: incident classifier fields
     for col, typ in (
         ("critical_sector", "TEXT"),
@@ -317,60 +331,18 @@ def mark_config_issue_alerted(con, issue_key: str):
     )
     con.commit()
 
-_USER_CONFIG_COLS = [
-    "chat_id", "notify_mode", "notify_detail", "priority_max",
-    "sme_only", "categories", "updated_at", "last_daily_summary",
-]
-
+# Delegación a bot_handlers para lógica de configuración de usuario
 def get_user_config(con, chat_id: str) -> dict:
-    row = con.execute(
-        "SELECT chat_id, notify_mode, notify_detail, priority_max, sme_only, "
-        "categories, updated_at, last_daily_summary FROM user_config WHERE chat_id=?",
-        (chat_id,)
-    ).fetchone()
-    if not row:
-        return {
-            "chat_id":            chat_id,
-            "notify_mode":        NOTIFY_MODE,
-            "notify_detail":      NOTIFY_DETAIL,
-            "priority_max":       SEND_PRIORITY_UP_TO,
-            "sme_only":           1 if SME_ONLY else 0,
-            "categories":         ",".join(CATEGORIES),
-            "last_daily_summary": "",
-        }
-    return dict(zip(_USER_CONFIG_COLS, row))
+    return bh.get_user_config(con, chat_id)
+
 
 def save_user_config(con, chat_id: str, **kwargs):
-    existing = get_user_config(con, chat_id)
-    existing.update(kwargs)
-    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-    con.execute("""
-        INSERT OR REPLACE INTO user_config
-        (chat_id, notify_mode, notify_detail, priority_max, sme_only,
-         categories, updated_at, last_daily_summary)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (
-        existing["chat_id"],
-        existing["notify_mode"],
-        existing["notify_detail"],
-        existing["priority_max"],
-        existing["sme_only"],
-        existing["categories"],
-        existing["updated_at"],
-        existing.get("last_daily_summary", ""),
-    ))
-    con.commit()
+    bh.save_user_config(con, chat_id, **kwargs)
+
 
 def should_process_for_user(item: dict, cfg: dict) -> bool:
-    if cfg["sme_only"] and not item.get("sme_relevant"):
-        return False
-    cats = [c.strip() for c in cfg["categories"].split(",") if c.strip()]
-    if cats and item.get("category") not in cats:
-        return False
-    priority = get_priority(item)
-    if priority == 0 or priority > cfg["priority_max"]:
-        return False
-    return True
+    """Wrapper que usa la lógica extendida de bot_handlers."""
+    return bh.should_notify_user(item, cfg)
 
 AYUDA_MSG = """
 *Comandos disponibles:*
@@ -417,7 +389,8 @@ async def handle_commands(bot, con):
         if not msg:
             continue
         chat_id = str(msg["chat"]["id"])
-        text    = msg.get("text", "").strip().lower()
+        # No lower() para preservar case en args de actores/búsquedas
+        text    = msg.get("text", "").strip()
 
         if not text.startswith("/"):
             continue
@@ -426,71 +399,59 @@ async def handle_commands(bot, con):
             logger.warning(f"comando ignorado de chat_id no autorizado: {chat_id}")
             continue
 
-        parts = text.split()
-        cmd   = parts[0]
-        arg   = parts[1] if len(parts) > 1 else ""
+        # Primero intentar handlers nuevos (bot_handlers)
+        reply = await bh.handle_user_command(bot, con, chat_id, text)
 
-        reply = None
+        # Si no fue manejado por bot_handlers, probar comandos legacy
+        if reply is None:
+            parts = text.split()
+            cmd   = parts[0].lower()
+            arg   = parts[1] if len(parts) > 1 else ""
 
-        if cmd == "/ayuda":
-            reply = AYUDA_MSG
-
-        elif cmd == "/status":
-            cfg = get_user_config(con, chat_id)
-            cats = cfg["categories"] or "todas"
-            reply = (
-                f"*Tu configuración actual:*\n"
-                f"Modo: `{cfg['notify_mode']}`\n"
-                f"Detalle: `{cfg['notify_detail']}`\n"
-                f"Prioridad máx: `P{cfg['priority_max']}`\n"
-                f"Solo relevante: `{'sí' if cfg['sme_only'] else 'no'}`\n"
-                f"Categorías: `{cats}`"
-            )
-
-        elif cmd == "/modo":
-            if arg in ("realtime", "daily", "both"):
-                save_user_config(con, chat_id, notify_mode=arg)
-                reply = f"✅ Modo cambiado a `{arg}`"
-            else:
-                reply = "❌ Valores válidos: `realtime`, `daily`, `both`"
-
-        elif cmd == "/detalle":
-            if arg in ("compact", "detailed", "minimal"):
-                save_user_config(con, chat_id, notify_detail=arg)
-                reply = f"✅ Detalle cambiado a `{arg}`"
-            else:
-                reply = "❌ Valores válidos: `compact`, `detailed`, `minimal`"
-
-        elif cmd == "/prioridad":
-            if arg in ("1", "2", "3"):
-                save_user_config(con, chat_id, priority_max=int(arg))
-                reply = f"✅ Prioridad máxima: `P{arg}`"
-            else:
-                reply = "❌ Valores válidos: `1`, `2`, `3`"
-
-        elif cmd == "/filtro":
-            if arg == "off":
-                save_user_config(con, chat_id, categories="")
-                reply = "✅ Filtro de categorías desactivado"
-            else:
-                valid = {"ransomware", "phishing", "exploit", "malware",
-                         "vulnerability", "breach", "other"}
-                cats  = [c.strip() for c in arg.split(",") if c.strip() in valid]
-                if cats:
-                    save_user_config(con, chat_id, categories=",".join(cats))
-                    reply = f"✅ Filtrando: `{', '.join(cats)}`"
+            if cmd == "/ayuda":
+                reply = bh.HELP_MSG  # nuevo help unificado
+            elif cmd == "/status":
+                reply = bh.cmd_config(con, chat_id)
+            elif cmd == "/modo":
+                if arg in ("realtime", "daily", "both"):
+                    save_user_config(con, chat_id, notify_mode=arg)
+                    reply = f"✅ Modo cambiado a `{arg}`"
                 else:
-                    reply = "❌ Categorías válidas: ransomware, phishing, exploit, malware, vulnerability, breach, other"
-
-        elif cmd == "/sme":
-            if arg == "on":
-                save_user_config(con, chat_id, sme_only=1)
-                reply = "✅ Solo items con impacto operacional"
-            elif arg == "off":
-                save_user_config(con, chat_id, sme_only=0)
-                reply = "✅ Mostrando todos los items"
-            else:
-                reply = "❌ Valores válidos: `on`, `off`"
+                    reply = "❌ Valores válidos: `realtime`, `daily`, `both`"
+            elif cmd == "/detalle":
+                if arg in ("compact", "detailed", "minimal"):
+                    save_user_config(con, chat_id, notify_detail=arg)
+                    reply = f"✅ Detalle cambiado a `{arg}`"
+                else:
+                    reply = "❌ Valores válidos: `compact`, `detailed`, `minimal`"
+            elif cmd == "/prioridad":
+                if arg in ("1", "2", "3"):
+                    save_user_config(con, chat_id, priority_max=int(arg))
+                    reply = f"✅ Prioridad máxima: `P{arg}`"
+                else:
+                    reply = "❌ Valores válidos: `1`, `2`, `3`"
+            elif cmd == "/filtro":
+                if arg == "off":
+                    save_user_config(con, chat_id, categories="")
+                    reply = "✅ Filtro de categorías desactivado"
+                else:
+                    valid = {"ransomware", "phishing", "exploit", "malware",
+                             "vulnerability", "breach", "other"}
+                    cats  = [c.strip() for c in arg.split(",") if c.strip() in valid]
+                    if cats:
+                        save_user_config(con, chat_id, categories=",".join(cats))
+                        reply = f"✅ Filtrando: `{', '.join(cats)}`"
+                    else:
+                        reply = "❌ Categorías válidas: ransomware, phishing, exploit, malware, vulnerability, breach, other"
+            elif cmd == "/sme":
+                if arg == "on":
+                    save_user_config(con, chat_id, sme_only=1)
+                    reply = "✅ Solo items con impacto operacional"
+                elif arg == "off":
+                    save_user_config(con, chat_id, sme_only=0)
+                    reply = "✅ Mostrando todos los items"
+                else:
+                    reply = "❌ Valores válidos: `on`, `off`"
 
         if reply:
             await bot.send_message(
@@ -1739,10 +1700,13 @@ async def run_fast_check():
 
         save_fast_item(fast_con, entry["id"])
 
-        # Enviar a todos los chats autorizados (sin filtro de modo — fast-check siempre avisa)
+        # Enviar a chats autorizados respetando preferencias de cada usuario
         for chat_id in chat_ids:
+            cfg = get_user_config(main_con, chat_id)
+            if not bh.should_notify_user(result, cfg):
+                continue
             try:
-                msg = format_message_for_critical(result, 1, "compact")
+                msg = format_message_for_critical(result, 1, cfg.get("notify_detail", "compact"))
                 await bot.send_message(
                     chat_id=chat_id,
                     text=msg,
